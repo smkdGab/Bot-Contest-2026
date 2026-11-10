@@ -30,6 +30,7 @@ class K10Transport:
         self.reply = None
         self.error = None
         self.lidar = None
+        self.lidar_intensity = None
         self.sensors = {}
         self.receiver = threading.Thread(target=self._receive, name="k10-receiver", daemon=True)
         self.receiver.start()
@@ -62,14 +63,16 @@ class K10Transport:
                             continue
                     self.sensors[reading.name] = reading
                 continue
-            if packet[0] == 0x8F:
+            if packet[0] in (0x8F, 0x8E):
                 try:
-                    frame = decode_frame(packet[:-8], time.monotonic())
+                    frame = decode_frame(b"\x8f"+packet[1:-8], time.monotonic())
                 except ValueError:
                     continue
                 with self.lock:
-                    if self.lidar is None or 0 < ((frame.frame_id-self.lidar.frame_id) & 0xFFFF) < 0x8000:
-                        self.lidar = frame
+                    name = "lidar" if packet[0] == 0x8F else "lidar_intensity"
+                    previous = getattr(self, name)
+                    if previous is None or 0 < ((frame.frame_id-previous.frame_id) & 0xFFFF) < 0x8000:
+                        setattr(self, name, frame)
                 continue
             with self.lock:
                 if self.pending is None or packet[0] != self.pending[0]:
@@ -78,14 +81,15 @@ class K10Transport:
                 body = packet[:-8]
                 # A standard ACK is 2 bytes, PING 5; both append UDP diagnostics.
                 short_error = action != 0x44 and len(body) == 2 and 1 <= body[1] <= 7
-                if len(packet) != length + 8 and not short_error:
+                valid_length = (length[0] <= len(body) <= length[1]) if isinstance(length, tuple) else len(body) == length
+                if not valid_length and not short_error:
                     self.error = RuntimeError(f"Malformed reply for action 0x{action:02x}")
                 else:
                     self.reply = body
                 self.pending = None
                 self.reply_ready.set()
 
-    def request(self, frame: bytes, *, cleanup: bool = False, length: int = 2, allow_status: bool = False) -> bytes:
+    def request(self, frame: bytes, *, cleanup: bool = False, length: int | tuple[int, int] = 2, allow_status: bool = False) -> bytes:
         with self.request_lock:
             if self.fault.is_set() and not cleanup:
                 raise RuntimeError("K10 session failed; start a new session, never replay motion")

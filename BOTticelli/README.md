@@ -61,6 +61,14 @@ connection. `--seconds` also bounds windowed sessions. For a dashboard check,
 add `--seconds 2 --screenshot /tmp/dashboard.png` to a windowed simulation.
 Recordings use exclusive creation, so existing files are never overwritten.
 
+## Hardware component tests
+
+Use `python -m botticelli hardware --host YOUR_BOT_IP shell` to test individual
+S0–S5 servos, DC motors, sensors, LEDs, display and sound. For example,
+`servo angle S3 90 --type 180` sets one positional servo. See the
+[hardware CLI guide](HARDWARE.md) for commands, units, cleanup and protocol limits.
+`hardware --dry-run ...` validates commands without contacting hardware.
+
 ## Controls and calibration
 
 - Release A after startup or controller loss, then hold **A** to drive.

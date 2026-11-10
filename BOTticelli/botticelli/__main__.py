@@ -1,4 +1,4 @@
-"""Command line entry point. Hardware imports and token prompt are drive-only."""
+"""CLI entry point. Hardware access is confined to explicit drive/bench commands."""
 import argparse
 from dataclasses import replace
 import getpass
@@ -171,6 +171,8 @@ def run_battle(args):
 def main():
     parser = argparse.ArgumentParser(description="BOTticelli gamepad car control")
     commands = parser.add_subparsers(dest="command", required=True)
+    from .hardware import add_parser
+    add_parser(commands)
     default_config = str(Path(__file__).resolve().parent.parent / "config" / "bot.yaml")
     check = commands.add_parser("gamepad-check", help="inspect input without connecting to hardware")
     check.add_argument("--config", default=default_config)
@@ -200,7 +202,7 @@ def main():
     try:
         args.run(args)
     except KeyboardInterrupt:
-        print("Interrupted; cleanup completed.", file=sys.stderr)
+        print("Interrupted; cleanup attempted (see any errors above).", file=sys.stderr)
     except (OSError, RuntimeError, ValueError, TypeError) as error:
         parser.exit(1, f"BOTticelli: {error}\n")
 
