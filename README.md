@@ -62,12 +62,13 @@ configuration. Read it from the screen and supply it at runtime.
 | Client | Use it for |
 |---|---|
 | [SensorsScreen](python_example/sensorscreen/README.md) | View HuskyLens, LiDAR, IMU, and geomagnetic data on a computer; access its documented servo, gamepad, and sound controls. |
+| [BOTticelli](BOTticelli/README.md) | Drive a front-steered car with one gamepad path, using a bounded IR-SIM practice arena or the real K10 backend after calibration. |
 
 Each client README owns its installation, configuration, launch, and offline test
 instructions. Choose the client that matches your actual hardware; do not assume
-the example's channel mapping matches your bot. There is no maintained bot
-simulator in this repository. Test new controller code with mocks or loopback
-before connecting to hardware.
+the example's channel mapping matches your bot. BOTticelli's practice simulation
+is a configurable approximation, not a hardware validation. Test new controller
+code with mocks or loopback before connecting to hardware.
 
 ## AI Assistants: Read Before Coding
 
@@ -107,7 +108,7 @@ active. Follow the sound tutorial for its complete limitations.
 The root Markdown files hold the guide content. Matching HTML pages provide the
 website navigation and render that Markdown using [marked.min.js](marked.min.js).
 Styles and images live alongside the guides; Python applications and their tests
-live under `python_example/`.
+live under `python_example/` and `BOTticelli/`.
 
 Keep protocol tables in the binary protocol reference, runnable examples in the
 client guide, and contest policy in the participant contest guide. Link to those

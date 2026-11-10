@@ -1,0 +1,3 @@
+[submodule "BOTticelli/vendor/ir-sim"]
+	path = BOTticelli/vendor/ir-sim
+	url = https://github.com/hanruihua/ir-sim.git
