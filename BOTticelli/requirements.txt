@@ -1,0 +1,5 @@
+# The submodule gitlink pins IR-SIM v2.11.0. Do not replace it with an unpinned PyPI install.
+./vendor/ir-sim
+pygame-ce==2.5.8
+PyYAML==6.0.3
+pytest==9.2.0

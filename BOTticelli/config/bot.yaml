@@ -1,0 +1,79 @@
+# Estimates for practice only. Hardware calibration is UNCONFIRMED.
+# Lengths are metres; angles are degrees except arena.start yaw (radians).
+car:
+  length: 0.30
+  width: 0.20
+  wheelbase: 0.20
+  max_speed: 0.30             # estimated speed at 100%; requires hardware measurement
+  max_steering_deg: 30        # estimated wheel angle; requires linkage calibration
+  speed_limit: 0.25          # initial 25% actuator limit, not measured velocity
+  drive_channel: 0           # example assignment, verify wiring
+  steering_channel: 1
+  drive_type: 2              # continuous servo, rear differential
+  steering_type: 0           # 0 = 180-degree positional; 1 = 270-degree positional
+  forward_sign: 1            # invert only after checking the unloaded drivetrain
+  steering_sign: 1           # maps positive left steering to increasing servo angle
+  steering_min: 60           # safe servo endpoints and center: estimates, verify unloaded
+  steering_center: 90
+  steering_max: 120
+gamepad:
+  index: 0
+  throttle_axis: 1
+  steering_axis: 0
+  throttle_sign: -1          # pushing stick up = forward
+  steering_sign: -1          # pushing stick right = right turn (negative yaw)
+  lb_button: 6               # Zikway HID gamepad left shoulder (SDL mapping)
+  a_button: 0
+  b_button: 1
+  dpad: true                 # stick + D-pad together; pressed D-pad axes take priority
+  hat: 0
+  deadzone: 0.08
+  stale_seconds: 0.12
+  throttle_mode: stick       # alternative: triggers (RT forward, LT reverse)
+  forward_trigger_axis: 4    # Zikway SDL mapping; verify for other gamepads
+  reverse_trigger_axis: 5
+  response_curve: 1.0        # direct, linear response
+  acceleration_rate: 0       # immediate throttle response
+  steering_rate: 0           # immediate steering response
+lidar:
+  enabled: true
+  x: 0.16                   # relative to rear axle; forward, left, up
+  y: 0
+  height: 0.15
+  tilt_deg: 0                # positive pitches upward
+  yaw_deg: 0                 # positive turns left
+  horizontal_deg: 120        # nominal SEN0682 coverage; simulated ray centers
+  vertical_deg: 20
+  minimum: 0.1
+  maximum: 5.0
+  hz: 8                     # fixed 64 columns x 8 rows
+  stale_seconds: 0.4
+  noise_std: 0               # simulation only: Gaussian metres
+  drop_probability: 0        # simulation only: probability of a whole dropped frame
+  seed: 7
+arena:
+  width: 4
+  height: 4
+  wall_height: 0.35
+  wall_thickness: 0.05
+  start: [1, 1, 1.5707963267948966] # rear axle x,y,yaw; pi/2 faces north (screen up)
+  drive_speed_scale: 8       # simulation only: full stick = 0.60 m/s with current car settings
+  battery_wh: 7.4            # estimated simulated battery energy
+  battery_percent: 100
+  obstacles:
+    - {x: 2, y: 2, length: 0.6, width: 0.4, height: 0.3}
+  opponent_route: [[3, 1], [3, 3], [1, 3], [1, 1]] # obstacle-free perimeter; waits if blocked
+  opponent_speed: 0.15
+  opponent_length: 0.30
+  opponent_width: 0.20
+  opponent_height: 0.20
+hardware:
+  sensors_enabled: true      # request IMU, compass, HuskyLens streams and battery readings
+  host: ""                  # bot IP from TFT; token is prompted privately, never stored
+  port: 24642
+  timeout: 0.10
+  channels_confirmed: false
+  types_confirmed: false
+  forward_confirmed: false
+  steering_confirmed: false  # confirms center AND safe endpoints
+  speed_confirmed: false

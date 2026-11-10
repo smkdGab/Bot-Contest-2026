@@ -1,0 +1,25 @@
+.venv/
+recordings/
+*.egg-info/
+dashboard-check.png
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+
+# Python/test/build output
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+build/
+dist/
+
+# Local tooling and OS files
+.mypy_cache/
+.ruff_cache/
+.DS_Store
+*.log

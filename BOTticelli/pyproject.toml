@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "botticelli"
+version = "0.1.0"
+description = "One gamepad controller for an IR-SIM car and the K10 bot"
+requires-python = ">=3.12"
+dependencies = ["ir-sim==2.11.0", "pygame-ce>=2.5,<3", "PyYAML>=6,<7"]
+
+[tool.setuptools.packages.find]
+include = ["botticelli*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

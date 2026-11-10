@@ -1,0 +1,29 @@
+{
+  "python": "3.12.3",
+  "packages": {
+    "ImageIO": "2.38.1",
+    "PyYAML": "6.0.3",
+    "Pygments": "2.21.0",
+    "botticelli": "0.1.0",
+    "contourpy": "1.4.0",
+    "cycler": "0.12.1",
+    "fonttools": "4.68.0",
+    "iniconfig": "2.3.1",
+    "ir-sim": "2.11.0",
+    "kiwisolver": "1.5.1",
+    "loguru": "0.7.3",
+    "matplotlib": "3.11.2",
+    "numpy": "2.5.4",
+    "packaging": "26.3",
+    "pillow": "13.0.0",
+    "pip": "24.0",
+    "pluggy": "1.7.0",
+    "pygame-ce": "2.5.8",
+    "pyparsing": "3.3.3",
+    "pytest": "9.2.0",
+    "python-dateutil": "4.0.0",
+    "scipy": "1.18.1",
+    "shapely": "2.2.0",
+    "tzdata": "2026.6"
+  }
+}
