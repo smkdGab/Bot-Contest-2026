@@ -31,7 +31,9 @@ For continuous servos, use `configure_servo(5, 'continuous')` and
 | Connection — UniHiker K10; battery via DFR1216 | `ping`, `name`, `battery` |
 
 Motion calls accept `ttl` (default 0.5 s, maximum 60 s); renew by issuing fresh
-motion calls. Expiry faults the session and attempts known stop/home commands.
+motion calls. A bounded reply wait comes first (`Robot(timeout=1)` by default);
+the hold lease starts after a valid ACK. Timeout faults the session without
+replaying motion. Lease expiry attempts known stop/home commands.
 `stop()` stops propulsion; positional homing happens at session exit.
 There is no automatic reconnect or replay of expired motion.
 

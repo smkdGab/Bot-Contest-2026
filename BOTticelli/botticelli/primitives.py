@@ -139,7 +139,7 @@ class Robot:
     Motion has a bounded lease (default 0.5 s). Repeat motion calls to renew it.
     Cleanup is best-effort; ACKs are not physical position feedback.
     """
-    def __init__(self, host, token, *, port=24642, timeout=.25, http_port=80, geomag_rate_format='u16be'):
+    def __init__(self, host, token, *, port=24642, timeout=1.0, http_port=80, geomag_rate_format='u16be'):
         if not host or not re.fullmatch(r'[A-Za-z0-9.-]+', host):
             raise ValueError('Set host to the K10 IP or hostname')
         integer(port, 1, 65535); integer(http_port, 1, 65535)
@@ -209,6 +209,13 @@ class Robot:
             raise RuntimeError('Open a registered Robot session first')
         self.transport.motion_deadline = time.monotonic() + seconds
 
+    def _motion(self, frame, ttl):
+        self._lease(ttl)
+        self.transport.motion_deadline += self.timeout  # bounded ACK wait, heartbeat stays independent
+        result = self._request(frame)
+        self._lease(ttl)  # hold duration starts only after a valid, timely ACK
+        return result
+
     def configure_servo(self, channel, kind, *, home=None, minimum=0, maximum=None):
         integer(channel, 0, 5)
         limits = servo_limits(kind, home, minimum, maximum)
@@ -229,8 +236,7 @@ class Robot:
             raise ValueError('Configure a positional servo with a safe home first')
         _, low, high = self.homes[channel]
         integer(degrees, low, high)
-        self._lease(ttl)
-        return self._request(bytes([0x24, 1 << channel]) + struct.pack('>h', degrees))
+        return self._motion(bytes([0x24, 1 << channel]) + struct.pack('>h', degrees), ttl)
 
     def servo_increment(self, channel, delta, *, ttl=.5):
         integer(delta, -270, 270)
@@ -247,8 +253,7 @@ class Robot:
         integer(channel, 0, 5); integer(percent, -100, 100)
         if channel not in self.continuous:
             raise ValueError('Configure a continuous servo first')
-        self._lease(ttl)
-        return self._request(bytes([0x23, 1 << channel, percent & 255]))
+        return self._motion(bytes([0x23, 1 << channel, percent & 255]), ttl)
 
     def servo_read(self, *channels):
         m = mask(channels, 6)
@@ -256,8 +261,7 @@ class Robot:
 
     def motor_speed(self, channel, percent, *, ttl=.5):
         integer(channel, 1, 4); integer(percent, -100, 100)
-        self._lease(ttl)
-        return self._request(bytes([0x21, 1 << (channel-1), percent & 255]))
+        return self._motion(bytes([0x21, 1 << (channel-1), percent & 255]), ttl)
 
     def motor_read(self, *channels):
         m = mask([integer(c, 1, 4)-1 for c in channels], 4)
@@ -495,11 +499,11 @@ class Robot:
     def stop(self):
         if self.transport is None or not self.registered:
             return
+        self.transport.motion_deadline = float('inf')
         confirmed = [self._cleanup(bytes([0x23, 1 << ch, 0])) for ch in sorted(self.continuous)]
         confirmed.append(self._cleanup(b'\x28'))
         if not all(confirmed):
             raise RuntimeError('Stop not confirmed: ' + '; '.join(self.cleanup_errors))
-        self.transport.motion_deadline = float('inf')
 
     @finish_cleanup()
     def close(self):

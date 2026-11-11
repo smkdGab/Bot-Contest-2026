@@ -103,10 +103,11 @@ def decode_reply(kind, body):
 
 
 class K10Transport:
-    def __init__(self, host: str, port: int = 24642, timeout: float = 0.10):
+    def __init__(self, host: str, port: int = 24642, timeout: float = 1.0):
         self.address = (socket.gethostbyname(host), port)
         self.timeout = timeout
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.bind(('', 0))
         self.sock.settimeout(0.02)
         self.done = threading.Event()
         self.heartbeat_done = threading.Event()
@@ -118,6 +119,7 @@ class K10Transport:
         self.pending = None
         self.reply = None
         self.error = None
+        self.received = self.other_sender = self.other_action = 0
         self.lidar = None
         self.lidar_intensity = None
         self.sensors = {}
@@ -138,8 +140,12 @@ class K10Transport:
                     self.fault.set()
                     self.reply_ready.set()
                 return
-            if sender != self.address or not packet:
+            if not packet:
                 continue
+            if sender != self.address:
+                self.other_sender += 1
+                continue
+            self.received += 1
             if packet[0] in (0x9F, 0xAF, 0xA0, 0x7F):
                 try:
                     reading = decode_sensor(packet[:-8], time.monotonic())
@@ -167,6 +173,7 @@ class K10Transport:
                 continue
             with self.lock:
                 if self.pending is None or packet[0] != self.pending[0]:
+                    self.other_action += 1
                     continue
                 action, length = self.pending
                 body = packet[:-8]
@@ -184,6 +191,7 @@ class K10Transport:
         with self.request_lock:
             if self.fault.is_set() and not cleanup:
                 raise RuntimeError("K10 session failed; start a new session, never replay motion")
+            received, other_sender, other_action = self.received, self.other_sender, self.other_action
             with self.lock:
                 self.reply_ready.clear()
                 self.reply = self.error = None
@@ -191,7 +199,10 @@ class K10Transport:
             try:
                 self.sock.sendto(frame, self.address)
                 if not self.reply_ready.wait(self.timeout):
-                    raise TimeoutError(f'K10 action 0x{frame[0]:02x}: no reply within {self.timeout:g}s; command outcome uncertain')
+                    raise TimeoutError(f'K10 action 0x{frame[0]:02x}: no reply within {self.timeout:g}s; command outcome uncertain. '
+                        f'UDP during this request: {self.received-received} packets from bot, '
+                        f'{self.other_sender-other_sender} ignored sender, {self.other_action-other_action} unmatched replies'
+                        + (f'; {self.fault_reason}' if self.fault_reason else ''))
                 if self.fault.is_set() and not cleanup:
                     raise RuntimeError(self.fault_reason or 'K10 receiver failed during request')
                 with self.lock:

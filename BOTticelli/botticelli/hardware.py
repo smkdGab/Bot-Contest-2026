@@ -338,7 +338,7 @@ def add_parser(commands):
     parser.add_argument('--host',help='bot IP or hostname (required for live commands)')
     parser.add_argument('--port', type=integer_between(1,65535),default=24642, help='K10 UDP port')
     parser.add_argument('--http-port', type=integer_between(1,65535),default=80, help='HTTP port for sound operations')
-    parser.add_argument('--timeout', type=float,default=.25,help='UDP reply timeout seconds (0.05..2)')
+    parser.add_argument('--timeout', type=float, default=1.0, help='UDP reply timeout seconds (0.05..2); independent of --seconds and heartbeat timing')
     parser.add_argument('--geomag-rate-format',choices=('u16be','u8'),default='u16be', help='explicit compass rate encoding; no automatic fallback')
     parser.add_argument('--dry-run',action='store_true',help='validate and show operations without sockets or token prompt')
     add_components(parser)

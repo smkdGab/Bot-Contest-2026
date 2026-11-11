@@ -112,6 +112,27 @@ def bot():
     finally: b.close()
 
 
+@pytest.fixture
+def delayed_acks(bot, monkeypatch):
+    """Delay selected replies while the mock keeps receiving heartbeats."""
+    delays, timers = {}, []
+    send = bot.send
+    def reply(body, target):
+        if body[0] in delays:
+            timer = threading.Timer(delays[body[0]], send, args=(body, target))
+            timers.append(timer)
+            timer.start()
+        else:
+            send(body, target)
+    monkeypatch.setattr(bot, 'send', reply)
+    try:
+        yield delays
+    finally:
+        for timer in timers:
+            timer.cancel()
+            timer.join()
+
+
 @contextmanager
 def bench(args):
     b=hw.Bench(args,token_provider=lambda:'test!')
@@ -127,6 +148,51 @@ def test_positional_defaults_configure_270_and_home_only_selected_servo(bot, cha
     assert bot.frames()[:3] == [b'\x41test!', bytes([0x22, 1 << channel, 1]), bytes([0x24, 1 << channel, 0, 45])]
     assert bot.frames()[-3:] == [b'\x28', bytes([0x24, 1 << channel, 0, 0]), b'\x42']
     assert not b.cleanup_errors
+
+
+@pytest.mark.parametrize('command, action, delay', [
+    ('servo continuous speed S0 20 --seconds .02', 0x22, .35),
+    ('servo continuous speed S0 20 --seconds .02', 0x23, .65),
+    ('servo positional angle S0 45 --seconds .02', 0x24, .35),
+    ('dc-motor speed M1 20 --seconds .02', 0x21, .35),
+    ('servo continuous speed S0 20 --seconds .02', 0x28, .35),
+    ('sensor lidar read', 0x81, .35),
+    ('sensor lidar watch --seconds .05', 0x83, .35),
+    ('sensor lidar intensity read --seconds .1', 0x89, .35),
+])
+def test_delayed_device_acks_do_not_timeout_or_expire_motion(bot, delayed_acks, command, action, delay):
+    delayed_acks[action] = delay
+    args = parse(command, bot)
+    assert args.timeout == 1
+    with bench(args) as client:
+        client.execute(args)
+        assert not client.transport.fault.is_set(), client.transport.fault_reason
+    assert not client.cleanup_errors
+    assert sum(p[0] == 0x41 for p in bot.frames()) == 1
+    assert bot.frames()[-1] == b'\x42'
+
+
+def test_udp_socket_is_bound_before_any_request(bot):
+    transport = K10Transport(*bot.address)
+    try:
+        assert transport.sock.getsockname()[1] != 0
+        assert transport.received == 0
+        assert transport.request(b'\x44\x01\x02\x03\x04', length=5) == b'\x44\x01\x02\x03\x04'
+    finally:
+        transport.close()
+
+
+def test_timeout_distinguishes_wrong_sender_and_unrelated_reply(bot):
+    bot.wrong.add(0x22)
+    transport = K10Transport(*bot.address, timeout=.08)
+    try:
+        with pytest.raises(TimeoutError) as result:
+            transport.request(b'\x22\x01\x02')
+        for term in ('1 packets from bot', '1 ignored sender', '1 unmatched replies'):
+            assert term in str(result.value)
+        assert transport.fault.is_set()
+    finally:
+        transport.close()
 
 
 @pytest.mark.parametrize('channel',range(6))
@@ -230,16 +296,34 @@ def test_stop_failure_does_not_hide_the_original_motion_error(bot, monkeypatch):
     assert bot.frames()[-1] == b'\x42'
 
 
-def test_multiple_continuous_cleanup_and_retyping_positionals(bot):
+@pytest.mark.parametrize('heartbeat_gap', [False, True])
+def test_multiple_continuous_cleanup_and_retyping_positionals(bot, monkeypatch, heartbeat_gap):
     args=parse('servo continuous configure S0',bot)
+    args.timeout = .05  # this test deliberately loses an ACK
     with bench(args) as b:
         b.execute(hw.validate(args))
         b.execute(hw.validate(parse('servo continuous configure S4',bot)))
         b.execute(hw.validate(parse('servo positional configure S0 --type 180 --home 90',bot)))
         assert b.continuous=={4}
+        transport = b.transport
+        cleanup_start = len(bot.frames())
         bot.drop.add(0x23)
-    assert bot.frames()[-4:]==[b'\x23\x10\x00',b'\x28',b'\x24\x01\x00\x5a',b'\x42']
+        if heartbeat_gap:
+            from types import SimpleNamespace
+            from botticelli import protocol
+            clock = time.monotonic
+            monkeypatch.setattr(protocol, 'time', SimpleNamespace(monotonic=lambda:
+                clock() + (.06 if threading.current_thread().name == 'k10-heartbeat' else 0)))
+    expected = [b'\x23\x10\x00', b'\x28', b'\x24\x01\x00\x5a', b'\x42']
+    tail = bot.frames()[cleanup_start:]
+    index = -1
+    for frame in expected:
+        index = tail.index(frame, index+1)
+    assert set(tail) <= set(expected)  # additional watchdog stop/home frames are valid
+    assert tail[-1] == b'\x42'
     assert b.cleanup_errors
+    if heartbeat_gap:
+        assert 'Heartbeat sender gap' in transport.fault_reason
 
 
 @pytest.mark.parametrize('command,frame',[

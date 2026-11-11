@@ -9,7 +9,7 @@ import time
 import pytest
 
 from botticelli.primitives import Robot
-from test_hardware import bot, http_bot
+from test_hardware import bot, delayed_acks, http_bot
 
 
 def robot(bot, **kwargs):
@@ -55,6 +55,39 @@ def test_session_registers_only_once_and_cannot_be_reopened(bot):
         assert client.battery()['battery_percent'] == 85
     assert sum(p[0] == 0x41 for p in bot.frames()) == 1
     with pytest.raises(RuntimeError): client.connect()
+
+
+def test_motion_lease_starts_after_the_ack_not_while_waiting_for_it(bot, delayed_acks):
+    delayed_acks[0x23] = .65
+    client = robot(bot)
+    try:
+        client.connect()
+        client.configure_servo(0, 'continuous')
+        client.servo_speed(0, 20, ttl=.04)
+        assert 0 < client.transport.motion_deadline-time.monotonic() <= .04
+        assert not client.transport.fault.is_set()
+        client.stop()
+        assert not client.transport.fault.is_set()
+    finally:
+        client.close()
+    assert not client.cleanup_errors
+
+
+def test_late_ack_after_timeout_never_revives_motion(bot, delayed_acks):
+    delayed_acks[0x23] = .12
+    client = robot(bot, timeout=.05)
+    try:
+        client.connect()
+        client.configure_servo(0, 'continuous')
+        with pytest.raises(TimeoutError):
+            client.servo_speed(0, 20, ttl=1)
+        time.sleep(.15)
+        assert client.transport.fault.is_set()
+        with pytest.raises(RuntimeError, match='never replay motion'):
+            client.servo_speed(0, 20)
+        assert sum(p == b'\x23\x01\x14' for p in bot.frames()) == 1
+    finally:
+        client.close()
 
 
 def test_documented_stream_state_and_lidar_reset(bot):

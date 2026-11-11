@@ -61,9 +61,11 @@ python -m botticelli hardware --dry-run servo positional angle CHANNEL ANGLE [--
 ```
 
 Connection options: `--host HOST`, `--port PORT` (24642), `--http-port PORT` (80),
-`--timeout SECONDS` (0.25), `--geomag-rate-format u16be|u8` (u16be).
+`--timeout SECONDS` (1), `--geomag-rate-format u16be|u8` (u16be).
 Live reads and sound register too. `capabilities`, help and dry-run stay offline.
 See [hardware setup and cleanup](HARDWARE.md) before motion.
+Reply timeout, motion duration (`--seconds`) and the 25 ms heartbeat are separate.
+Timeouts include UDP receive/ignored-packet counts; timed-out motion is never retried.
 
 ## Hardware commands
 
