@@ -89,6 +89,69 @@ def test_cleanup_failure_is_reported_by_context(bot):
     assert bot.frames()[-1] == b'\x42'
 
 
+def test_later_confirmed_stop_clears_only_the_resolved_cleanup_error(bot):
+    client = robot(bot, timeout=.05)
+    client.connect()
+    bot.drop.add(0x28)
+    with pytest.raises(RuntimeError, match='stop DC motors'):
+        client.stop()
+    assert len(client.cleanup_errors) == 1
+    bot.drop.clear()
+    client.close()
+    assert not client.cleanup_errors
+    assert bot.frames()[-2:] == [b'\x28', b'\x42']
+
+
+def test_cleanup_rejection_names_the_servo_and_firmware_status(bot):
+    client = robot(bot)
+    client.connect()
+    client.configure_servo(4, 270, home=0)
+    bot.reject.add(0x24)
+    client.close()
+    assert len(client.cleanup_errors) == 1
+    for term in ('home positional servo S4 to 0 degrees', '0x24', 'operation failed', 'status 0x03'):
+        assert term in client.cleanup_errors[0]
+
+
+def test_missing_cleanup_ack_stays_unconfirmed_with_action_and_timeout(bot):
+    client = robot(bot, timeout=.05)
+    client.connect()
+    bot.drop.add(0x42)
+    client.close()
+    assert len(client.cleanup_errors) == 1
+    for term in ('unregister', '0x42', 'no reply', '0.05s'):
+        assert term in client.cleanup_errors[0]
+
+
+def test_cleanup_ack_without_diagnostics_is_reported_as_malformed(bot, monkeypatch):
+    send = bot.send
+    def reply(body, target):
+        if body[0] == 0x42:
+            bot.sock.sendto(body, target)
+        else:
+            send(body, target)
+    monkeypatch.setattr(bot, 'send', reply)
+    client = robot(bot)
+    client.connect()
+    client.close()
+    assert len(client.cleanup_errors) == 1
+    for term in ('unregister', 'received 2 bytes', 'plus 8 diagnostics bytes'):
+        assert term in client.cleanup_errors[0]
+
+
+def test_delayed_cleanup_ack_is_confirmed_without_resending(bot, monkeypatch):
+    send = bot.send
+    def reply(body, target):
+        if body[0] in (0x28, 0x42):
+            time.sleep(.02)
+        send(body, target)
+    monkeypatch.setattr(bot, 'send', reply)
+    with robot(bot) as client:
+        pass
+    assert not client.cleanup_errors
+    assert bot.frames() == [b'\x41test!', b'\x28', b'\x42']
+
+
 def test_unregistered_reads_never_open_a_socket(monkeypatch):
     import socket
     client = Robot('127.0.0.1', 'test!')

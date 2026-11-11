@@ -111,6 +111,7 @@ class K10Transport:
         self.done = threading.Event()
         self.heartbeat_done = threading.Event()
         self.fault = threading.Event()
+        self.fault_reason = ''
         self.reply_ready = threading.Event()
         self.request_lock = threading.Lock()
         self.lock = threading.Lock()
@@ -192,7 +193,7 @@ class K10Transport:
                 if not self.reply_ready.wait(self.timeout):
                     raise TimeoutError(f'K10 action 0x{frame[0]:02x}: no reply within {self.timeout:g}s; command outcome uncertain')
                 if self.fault.is_set() and not cleanup:
-                    raise RuntimeError('K10 watchdog or receiver failed during request')
+                    raise RuntimeError(self.fault_reason or 'K10 receiver failed during request')
                 with self.lock:
                     if self.error:
                         raise self.error
@@ -219,6 +220,8 @@ class K10Transport:
             while not self.heartbeat_done.is_set():
                 now = time.monotonic()
                 if now - last > 0.050 or now >= self.motion_deadline:
+                    self.fault_reason = (f'Heartbeat sender gap {(now-last)*1000:.1f} ms exceeded 50 ms; stop/home attempted'
+                        if now-last > 0.050 else 'Motion lease expired; stop/home attempted')
                     self.fault.set()
                     # No ACK waits here: the sole receiver remains the dispatcher.
                     # Only known stops/home targets, never the expired command.
@@ -232,7 +235,8 @@ class K10Transport:
                     return
                 try:
                     self.sock.sendto(b"\x43", self.address)
-                except OSError:
+                except OSError as error:
+                    self.fault_reason = f'Heartbeat send failed: {error}'
                     self.fault.set()
                     return
                 last = now

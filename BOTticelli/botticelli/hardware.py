@@ -4,12 +4,14 @@ Wire authority: binary-protocol.md, plus SensorsScreen's stream/illumination
 helpers. No undocumented sensor configuration or calibration payloads are sent.
 """
 import argparse
+from functools import partial
 import math
 from pathlib import Path
 import re
 import shlex
 import sys
 import time
+from textwrap import fill
 
 from .primitives import Robot, STREAMS, ALGORITHMS, SCREENS, servo_limits, filename, wav_bytes
 from .primitives import private_token, termination_cleanup
@@ -38,14 +40,25 @@ CAPABILITIES = {
 }
 
 
+class HelpFormatter(argparse.ArgumentDefaultsHelpFormatter):
+    def _get_help_string(self, action):
+        return action.help if action.default is None else super()._get_help_string(action)
+
+
 class Parser(argparse.ArgumentParser):
-    """Standard argparse, with required labels and an example on errors."""
-    def __init__(self, *args, **kwargs):
-        kwargs.setdefault('formatter_class', argparse.ArgumentDefaultsHelpFormatter)
+    """UNIX-style help generated from the arguments actually accepted."""
+    def __init__(self, *args, parent=None, **kwargs):
+        self.connection = getattr(parent, 'connection', None)
+        kwargs.setdefault('formatter_class', HelpFormatter)
         super().__init__(*args, **kwargs)
+        self._positionals.title = 'ARGUMENTS'
+        self._optionals.title = 'OPTIONS'
 
     def add_argument(self, *args, **kwargs):
         action = super().add_argument(*args, **kwargs)
+        if action.choices is not None:
+            action.metavar = action.metavar or (action.option_strings[-1].lstrip('-') if action.option_strings else action.dest).upper().replace('-', '_')
+            action.help = (action.help or action.dest) + '; choices: ' + ', '.join(map(str, action.choices))
         if action.required:
             action.help = (action.help or action.dest) + ' (required)'
         return action
@@ -53,21 +66,79 @@ class Parser(argparse.ArgumentParser):
     def add_subparsers(self, **kwargs):
         kwargs.setdefault('title', 'commands (required)')
         kwargs.setdefault('help', 'choose a command (required)')
+        kwargs.setdefault('parser_class', partial(type(self), parent=self))
         return super().add_subparsers(**kwargs)
+
+    def synopsis(self):
+        operands, options, subcommand = [], [], []
+        formatter = self._get_formatter()
+        for action in self._actions:
+            if isinstance(action, argparse._HelpAction):
+                continue
+            if isinstance(action, argparse._SubParsersAction):
+                subcommand = ['COMMAND [ARGS]']
+                continue
+            value = formatter._format_args(action, action.metavar or action.dest.upper())
+            if action.option_strings:
+                token = action.option_strings[-1] + (' ' + value if action.nargs != 0 else '')
+                options.append(token if action.required else '[' + token + ']')
+            else:
+                operands.append(value)
+        prog = self.prog.removeprefix('k10').lstrip() if self.prog == 'k10' or self.prog.startswith('k10 ') else self.prog
+        if self.connection is not None and self.connection is not self:
+            prog = prog.replace(self.connection.prog, self.connection.prog + ' [CONNECTION OPTIONS]', 1)
+        return ' '.join(filter(None, [prog, *operands, *options, *subcommand]))
+
+    def format_usage(self):
+        return fill('usage: ' + self.synopsis(), width=78, subsequent_indent='    ') + '\n'
+
+    def command_synopses(self):
+        groups = [a for a in self._actions if isinstance(a, argparse._SubParsersAction)]
+        if not groups:
+            yield self.synopsis()
+        for group in groups:
+            for child in group.choices.values():
+                yield from child.command_synopses()
+
+    def format_help(self):
+        formatter = self._get_formatter()
+        formatter.start_section('DESCRIPTION')
+        formatter.add_text(self.description)
+        formatter.end_section()
+        for group in self._action_groups:
+            formatter.start_section(group.title.upper())
+            formatter.add_arguments(group._group_actions)
+            formatter.end_section()
+        if self.connection is not None and self.connection is not self:
+            formatter.start_section('CONNECTION OPTIONS (before the component command)')
+            formatter.add_arguments(a for a in self.connection._optionals._group_actions if a.dest != 'help')
+            formatter.end_section()
+        for action in self._actions:
+            if isinstance(action, argparse._SubParsersAction):
+                formatter.start_section('COMMAND SYNOPSIS')
+                for child in action.choices.values():
+                    for syntax in child.command_synopses():
+                        formatter.add_text(syntax)
+                formatter.end_section()
+        formatter.start_section('EXAMPLE')
+        formatter.add_text(self.synopsis())
+        formatter.add_text('Replace UPPERCASE operands; [brackets] mark optional arguments. Use COMMAND --help for details.')
+        formatter.end_section()
+        return self.format_usage() + '\n' + formatter.format_help()
+
+    def parse_known_args(self, args=None, namespace=None):
+        self.set_defaults(example=self.synopsis())
+        return super().parse_known_args(args, namespace)
 
     def error(self, message):
         self.print_usage(sys.stderr)
-        self.exit(2, f'{self.prog}: {message}\n{self.epilog or ""}\nHelp: {self.prog} --help\n')
+        help_command = self.prog.removeprefix('k10 ').strip() + ' --help' if self.prog != 'k10' else 'help'
+        self.exit(2, f'{self.prog}: {message}\nExample: {self.synopsis()}\nHelp: {help_command}\n')
 
 
-def command(commands, name, summary, example, *, device=None):
+def command(commands, name, summary, *, device=None):
     parser = commands.add_parser(name, help=summary,
-        description=f'{device}: {summary}' if device else summary,
-        epilog='Example: ' + example)
-    if parser.prog.startswith('python -m botticelli hardware') and not example.startswith('python '):
-        example = 'python -m botticelli hardware --host YOUR_BOT_IP ' + example
-    parser.epilog = 'Example: ' + example
-    parser.set_defaults(example=example)
+        description=f'{device}: {summary}' if device else summary)
     if device:
         parser.set_defaults(device_name=device)
     return parser
@@ -130,13 +201,13 @@ def finite_seconds(text):
     return value
 
 
-def add_sensor_commands(root, name, path):
+def add_sensor_commands(root, name):
     device = SENSOR_NAMES.get(name, 'All documented sensors')
     root.set_defaults(sensor=name, device_name=device)
     actions = root.add_subparsers(dest='action', required=True)
     for verb in ('watch',) if name in ('bump', 'all') else ('read', 'watch'):
         p = command(actions, verb, 'Read one fresh sample as a table or color heatmap.' if verb == 'read' else
-            'Watch readings in this terminal; pipes receive plain snapshots.', path+' '+verb, device=device)
+            'Watch readings in this terminal; pipes receive plain snapshots.', device=device)
         p.add_argument('--seconds', type=finite_seconds, default=5. if verb=='watch' else 2., help='watch duration or streamed-read deadline, in (0, 60] seconds')
         p.add_argument('--hz', type=integer_between(1,400), default=8 if name in ('lidar','intensity','camera','all') else 10, help='stream rate: LiDAR <=8, HuskyLens <=20, compass <=50, IMU <=400 Hz; unused for direct IMU/LiDAR reads')
         p.set_defaults(full=False, cell=None)
@@ -144,24 +215,24 @@ def add_sensor_commands(root, name, path):
             p.add_argument('--full', action='store_true', help='show all 512 exact values in numbered grids')
             p.add_argument('--cell', nargs=2, type=int, metavar=('ROW','COL'), help='inspect row 0..7, column 0..63')
     if name=='imu':
-        command(actions, 'config', 'Read acceleration configuration.', path+' config', device=device)
-        command(actions, 'reset', 'Reset acceleration configuration; does not reboot the K10.', path+' reset', device=device)
-        p = command(actions, 'configure', 'Write raw acceleration settings; confirm codes supported by your device.', path+' configure --range-code 1 --rate-hz 100 --power-code 0 --hpf-code 1', device=device)
+        command(actions, 'config', 'Read acceleration configuration.', device=device)
+        command(actions, 'reset', 'Reset acceleration configuration; does not reboot the K10.', device=device)
+        p = command(actions, 'configure', 'Write raw acceleration settings; confirm codes supported by your device.', device=device)
         p.add_argument('--range-code', type=integer_between(0,255), required=True, help='raw range code, 0..255')
         p.add_argument('--rate-hz', type=integer_between(1,65535), required=True, help='sampling rate in Hz; device may reject unsupported values')
         p.add_argument('--power-code', type=integer_between(0,255), required=True, help='raw power mode code, 0..255')
         p.add_argument('--hpf-code', type=integer_between(0,255), required=True, help='raw high-pass filter code, 0..255')
     elif name=='bump':
-        command(actions, 'config', 'Read impact threshold and debounce interval.', path+' config', device=device)
-        p = command(actions, 'configure', 'Set impact threshold and debounce interval.', path+' configure --threshold-mg 500 --debounce-ms 100', device=device)
+        command(actions, 'config', 'Read impact threshold and debounce interval.', device=device)
+        p = command(actions, 'configure', 'Set impact threshold and debounce interval.', device=device)
         p.add_argument('--threshold-mg', type=integer_between(0,65535), required=True, help='acceleration threshold in mg')
         p.add_argument('--debounce-ms', type=integer_between(0,65535), required=True, help='minimum interval between events in milliseconds')
     elif name=='camera':
-        command(actions, 'algorithm', 'Read algorithm and learned-ID count.', path+' algorithm', device=device)
-        p = command(actions, 'set-algorithm', 'Select an algorithm; training is done on the sensor.', path+' set-algorithm color', device=device)
+        command(actions, 'algorithm', 'Read algorithm and learned-ID count.', device=device)
+        p = command(actions, 'set-algorithm', 'Select an algorithm; training is done on the sensor.', device=device)
         p.add_argument('algorithm', choices=ALGORITHMS, help='algorithm name')
-        command(actions, 'controls', 'Read control state and support flags.', path+' controls', device=device)
-        p = command(actions, 'illumination', 'Switch illumination on or off.', path+' illumination on', device=device)
+        command(actions, 'controls', 'Read control state and support flags.', device=device)
+        p = command(actions, 'illumination', 'Switch illumination on or off.', device=device)
         p.add_argument('state', choices=('on','off'), help='illumination state')
     return actions
 
@@ -171,26 +242,21 @@ def add_components(parser, *, shell=True):
     for name, summary in (('capabilities', 'List usable hardware features from the contest documentation; offline.'),
                           ('ping', 'Check the K10 connection with a matched ping reply.'),
                           ('name', 'Read the K10 name.'), ('battery', 'Read DFR1216 battery charge in percent.')):
-        command(groups, name, summary, 'python -m botticelli hardware ' +
-                (name if name == 'capabilities' else '--host YOUR_BOT_IP ' + name),
+        command(groups, name, summary,
                 device='DFRobot DFR1216' if name == 'battery' else 'UniHiker K10')
     if shell:
-        command(groups, 'shell', 'Register once and run commands interactively. Use help COMMAND, exit or Ctrl+C.',
-                'python -m botticelli hardware --host YOUR_BOT_IP shell', device='UniHiker K10')
-    stop = command(groups, 'stop', 'Stop DC motors and explicitly selected continuous servos; best-effort network stop.',
-                   'stop --continuous S0 S4', device='DFRobot DFR1216')
+        command(groups, 'shell', 'Register once and run commands interactively. Use help COMMAND, exit or Ctrl+C.', device='UniHiker K10')
+    stop = command(groups, 'stop', 'Stop DC motors and explicitly selected continuous servos; best-effort network stop.', device='DFRobot DFR1216')
     stop.add_argument('--continuous', nargs='+', type=channel('S',6), default=[], help='known continuous channels S0..S5 to zero individually')
-    servo = command(groups, 'servo', 'Select positional servos (degrees) or continuous servos (speed).',
-                    'servo positional angle S0 45', device='DFRobot DFR1216, S0..S5')
+    servo = command(groups, 'servo', 'Select positional servos (degrees) or continuous servos (speed).', device='DFRobot DFR1216, S0..S5')
     families = servo.add_subparsers(dest='family', required=True)
-    for family, parent, path, summary in (
-            ('positional', families, 'servo positional', 'Position in degrees; defaults: type 270, home 0.'),
-            ('continuous', families, 'servo continuous', 'Rotation speed in percent; zero stops rotation.'),
-            ('dc-motor', groups, 'dc-motor', 'DC motors on M1..M4, separate from the servo outputs S0..S5.')):
+    for family, parent, summary in (
+            ('positional', families, 'Position in degrees; defaults: type 270, home 0.'),
+            ('continuous', families, 'Rotation speed in percent; zero stops rotation.'),
+            ('dc-motor', groups, 'DC motors on M1..M4, separate from the servo outputs S0..S5.')):
         dc = family == 'dc-motor'
         positional = family == 'positional'
-        example_channel = 'M1' if dc else 'S0' if positional else 'S5'
-        root = command(parent, family, summary, path+(' angle ' if positional else ' speed ')+example_channel+' '+('45' if positional else '15'), device='DFRobot DFR1216')
+        root = command(parent, family, summary, device='DFRobot DFR1216')
         actions = root.add_subparsers(dest='action', required=True)
         verbs = ('angle','increment','configure','read') if positional else ('speed','read') if dc else ('speed','configure')
         for verb in verbs:
@@ -199,8 +265,7 @@ def add_components(parser, *, shell=True):
                 'configure':'Configure only this servo channel.',
                 'read':'Read commanded values; no physical encoder feedback.',
                 'speed':'Set signed speed percent (-100..100), then stop after --seconds.'}[verb]
-            example = path+' '+verb+' '+example_channel+(' 45' if verb=='angle' else ' 10' if verb in ('increment','speed') else '')
-            p = command(actions, verb, description, example, device='DFRobot DFR1216')
+            p = command(actions, verb, description, device='DFRobot DFR1216')
             p.add_argument('channels' if verb=='read' else 'channel', nargs='+' if verb=='read' else None,
                 type=channel('M',4,1) if dc else channel('S',6), metavar='CHANNEL',
                 help='DC motor output M1..M4' if dc else 'positional servo S0..S5' if positional else 'continuous servo S0..S5')
@@ -208,23 +273,24 @@ def add_components(parser, *, shell=True):
                 p.add_argument('value', type=integer_between(0 if verb=='angle' else -270 if positional else -100, 270 if positional else 100),
                     metavar='ANGLE' if verb=='angle' else 'DELTA' if verb=='increment' else 'PERCENT',
                     help='angle in degrees' if verb=='angle' else 'signed change in degrees' if verb=='increment' else 'signed speed percent; 0 stops')
-                p.add_argument('--seconds', type=finite_seconds, default=1., help='session duration in seconds, at most 60')
+                p.add_argument('--seconds', type=finite_seconds, default=1., metavar='SECONDS',
+                    help=('hold speed for SECONDS, then stop' if verb == 'speed' else
+                          'keep the session active for SECONDS; home on exit') + '; greater than 0, at most 60')
             if positional and verb != 'read':
                 p.add_argument('--type', dest='servo_type', type=int, choices=(180,270), default=270, help='positional servo range in degrees')
                 p.add_argument('--home', type=integer_between(0,270), default=0, help='home angle on exit, in degrees')
                 p.add_argument('--min-angle', type=integer_between(0,270), default=0, help='safe lower endpoint in degrees')
                 p.add_argument('--max-angle', type=integer_between(0,270), help='safe upper endpoint; default: servo type range')
-    led = command(groups, 'led', 'Control K10 NeoPixels and DFR1216 WS2812 LEDs.', 'led read L0 L3', device='UniHiker K10 / DFRobot DFR1216')
+    led = command(groups, 'led', 'Control K10 NeoPixels and DFR1216 WS2812 LEDs.', device='UniHiker K10 / DFRobot DFR1216')
     led.set_defaults(board=False)
     led_actions = led.add_subparsers(dest='action', required=True)
-    board = command(led_actions, 'board', 'Use the DFR1216 board LED service, indexes 0..2.', 'led board read', device='DFRobot DFR1216')
+    board = command(led_actions, 'board', 'Use the DFR1216 board LED service, indexes 0..2.', device='DFRobot DFR1216')
     board.set_defaults(board=True)
-    for board_mode, actions, path, device in (
-            (False, led_actions, 'led', 'UniHiker K10 NeoPixels / DFR1216 WS2812 LEDs'),
-            (True, board.add_subparsers(dest='action', required=True), 'led board', 'DFRobot DFR1216')):
+    for board_mode, actions, device in (
+            (False, led_actions, 'UniHiker K10 NeoPixels / DFR1216 WS2812 LEDs'),
+            (True, board.add_subparsers(dest='action', required=True), 'DFRobot DFR1216')):
         for verb in ('set','read','off'):
-            example = path+' '+verb+(' L0' if not board_mode else ' 0' if verb != 'read' else '')+(' --rgb 255 0 0' if verb == 'set' else '')
-            p = command(actions, verb, {'set':'Set RGB color and brightness.', 'read':'Read LED state.', 'off':'Turn selected LEDs off.'}[verb], example, device=device)
+            p = command(actions, verb, {'set':'Set RGB color and brightness.', 'read':'Read LED state.', 'off':'Turn selected LEDs off.'}[verb], device=device)
             if not board_mode:
                 p.add_argument('channels', nargs='+', type=channel('L',5), help='L0..L2: K10 NeoPixels; L3/L4: DFR1216 WS2812 LEDs')
             elif verb!='read':
@@ -232,33 +298,32 @@ def add_components(parser, *, shell=True):
             if verb=='set':
                 p.add_argument('--rgb', nargs=3, type=integer_between(0,255), required=True, metavar=('R','G','B'), help='red, green, blue bytes, each 0..255')
                 p.add_argument('--brightness', type=integer_between(0,255), default=64, help='raw firmware brightness byte 0..255, default 64')
-    screen = command(groups, 'screen', 'Select a K10 TFT screen or move to the next/previous screen.', 'screen app-info', device='UniHiker K10 TFT')
+    screen = command(groups, 'screen', 'Select a K10 TFT screen or move to the next/previous screen.', device='UniHiker K10 TFT')
     screen.add_argument('screen', choices=(*SCREENS,'next','previous'), help='screen name or navigation direction')
-    sensor = command(groups, 'sensor', 'Read or configure sensors, grouped by physical device.', 'sensor imu read').add_subparsers(dest='device', required=True)
+    sensor = command(groups, 'sensor', 'Read or configure sensors, grouped by physical device.').add_subparsers(dest='device', required=True)
     for name in ('lidar', 'imu', 'compass', 'huskylens', 'all'):
         stream = 'camera' if name == 'huskylens' else name
         device = SENSOR_NAMES.get(stream, 'All documented sensors')
-        path = 'sensor '+name
-        root = command(sensor, name, device+'.', path+' watch --seconds 5')
+        root = command(sensor, name, device+'.')
         root.set_defaults(view='')
-        actions = add_sensor_commands(root, stream, path)
+        actions = add_sensor_commands(root, stream)
         if name in ('lidar', 'imu'):
             view = 'intensity' if name == 'lidar' else 'bump'
             summary = 'Raw signal strength from this LiDAR.' if name == 'lidar' else 'Impact detection from this accelerometer; no event is normal.'
-            child = command(actions, view, summary, path+' '+view+' watch', device=device)
+            child = command(actions, view, summary, device=device)
             child.set_defaults(view=view)
-            add_sensor_commands(child, view, path+' '+view)
-    sound = command(groups, 'sound', 'Manage stored PCM WAV files and playback over HTTP.', 'sound list', device='UniHiker K10 speaker').add_subparsers(dest='action',required=True)
+            add_sensor_commands(child, view)
+    sound = command(groups, 'sound', 'Manage stored PCM WAV files and playback over HTTP.', device='UniHiker K10 speaker').add_subparsers(dest='action',required=True)
     for verb in ('list','status','stop','play','upload','delete','volume'):
-        summary, example = {
-            'list': ('List stored sound files.', 'sound list'), 'status': ('Read playback state and errors.', 'sound status'),
-            'stop': ('Stop playback and wait up to ten seconds for inactivity.', 'sound stop'),
-            'play': ('Play a stored WAV; acceptance does not confirm audible playback.', 'sound play beep.wav'),
-            'upload': ('Upload a PCM WAV (<=300 KiB), replacing the same filename. Playback must be inactive.', 'sound upload beep.wav ./beep.wav'),
-            'delete': ('Delete a stored WAV while playback is inactive.', 'sound delete beep.wav'),
-            'volume': ('Set playback volume from 0 to 100 percent.', 'sound volume 25'),
+        summary = {
+            'list': 'List stored sound files.', 'status': 'Read playback state and errors.',
+            'stop': 'Stop playback and wait up to ten seconds for inactivity.',
+            'play': 'Play a stored WAV; acceptance does not confirm audible playback.',
+            'upload': 'Upload a PCM WAV (<=300 KiB), replacing the same filename. Playback must be inactive.',
+            'delete': 'Delete a stored WAV while playback is inactive.',
+            'volume': 'Set playback volume from 0 to 100 percent.',
         }[verb]
-        p = command(sound, verb, summary, example, device='UniHiker K10 speaker')
+        p = command(sound, verb, summary, device='UniHiker K10 speaker')
         if verb in ('play','upload','delete'):
             p.add_argument('filename',help='simple ASCII .wav filename stored on the bot')
         if verb=='upload':
@@ -268,7 +333,8 @@ def add_components(parser, *, shell=True):
 
 
 def add_parser(commands):
-    parser = command(commands, 'hardware', 'Test K10 components. Live sessions register once; help and dry-run are offline. Put connection options before the component command.', 'python -m botticelli hardware --host YOUR_BOT_IP shell', device='UniHiker K10 / DFRobot DFR1216')
+    parser = command(commands, 'hardware', 'Test K10 components. Live sessions register once; help and dry-run are offline. Put connection options before the component command.', device='UniHiker K10 / DFRobot DFR1216')
+    parser.connection = parser
     parser.add_argument('--host',help='bot IP or hostname (required for live commands)')
     parser.add_argument('--port', type=integer_between(1,65535),default=24642, help='K10 UDP port')
     parser.add_argument('--http-port', type=integer_between(1,65535),default=80, help='HTTP port for sound operations')
@@ -325,7 +391,7 @@ class Bench(Robot):
         deadline = time.monotonic() + seconds
         while time.monotonic() < deadline:
             if self.transport.fault.is_set():
-                raise RuntimeError('Communication or heartbeat failed; tests stopped')
+                raise RuntimeError(self.transport.fault_reason or 'Communication failed; session stopped')
             self.transport.done.wait(min(.02, max(0, deadline-time.monotonic())))
 
     def execute(self, args):
@@ -343,6 +409,8 @@ class Bench(Robot):
             return
         self.connect()
         duration = getattr(args, 'seconds', 0) if c in ('servo', 'dc-motor') else 0
+        motion_started = None
+        held_seconds = None
         result = None
         try:
             if c in ('ping', 'name', 'battery'):
@@ -398,11 +466,21 @@ class Bench(Robot):
                 elif a == 'volume': result = self.sound_volume(args.value)
                 else: result = getattr(self, 'sound_'+a)(args.filename)
             if duration:
+                motion_started = time.monotonic()
                 self.wait(duration)
         finally:
             if duration:
-                self.stop()  # before potentially blocked console output
+                failed = sys.exc_info()[0] is not None
+                if motion_started is not None:
+                    held_seconds = time.monotonic()-motion_started
+                try:
+                    self.stop()  # before potentially blocked console output
+                except RuntimeError:
+                    if not failed:
+                        raise  # pending cleanup errors are reported separately
         details = {'request':requested(args)} if not result or result.get('ok') else {}
+        if held_seconds is not None:
+            details['command_held_s'] = round(held_seconds, 3)
         if c=='sensor' and a=='read':
             details.update(sensor=args.sensor, _received_at=time.monotonic(),
                            _cell=getattr(args, 'cell', None), _full=args.full)
@@ -478,7 +556,7 @@ def run(args):
     with termination_cleanup():
         try:
             if args.component == 'shell':
-                parser = Parser(prog='k10', epilog='Example: servo positional angle S0 45')
+                parser = Parser(prog='k10', description='K10 hardware shell; connection is already registered. Type exit to finish.')
                 add_components(parser, shell=False)
                 if not offline: bench.connect()  # register before the first prompt
                 print('K10 bench. Type help for commands, exit to stop and return selected servos home.')

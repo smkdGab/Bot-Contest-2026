@@ -20,7 +20,7 @@ from botticelli.primitives import stream_frame
 
 
 def parse(command, server=None, *, dry=False):
-    parser=argparse.ArgumentParser()
+    parser=hw.Parser()
     commands=parser.add_subparsers(dest='command',required=True)
     hw.add_parser(commands)
     prefix='hardware '+('--dry-run ' if dry else '')
@@ -120,8 +120,18 @@ def bench(args):
 
 
 @pytest.mark.parametrize('channel',range(6))
+def test_positional_defaults_configure_270_and_home_only_selected_servo(bot, channel):
+    args = parse(f'servo positional angle S{channel} 45 --seconds .001', bot)
+    with bench(args) as b:
+        b.execute(args)
+    assert bot.frames()[:3] == [b'\x41test!', bytes([0x22, 1 << channel, 1]), bytes([0x24, 1 << channel, 0, 45])]
+    assert bot.frames()[-3:] == [b'\x28', bytes([0x24, 1 << channel, 0, 0]), b'\x42']
+    assert not b.cleanup_errors
+
+
+@pytest.mark.parametrize('channel',range(6))
 def test_every_servo_channel_configures_before_absolute_angle_and_cleans_up(bot,channel):
-    args=parse(f'servo angle S{channel} 120 --type 180 --home 90 --seconds .001',bot)
+    args=parse(f'servo positional angle S{channel} 120 --type 180 --home 90 --seconds .001',bot)
     with bench(args) as b: b.execute(hw.validate(args))
     assert bot.frames()[:3]==[b'\x41test!',bytes([0x22,1<<channel,0]),bytes([0x24,1<<channel,0,120])]
     assert bot.frames()[-3:]==[b'\x28',bytes([0x24,1<<channel,0,90]),b'\x42']
@@ -129,10 +139,10 @@ def test_every_servo_channel_configures_before_absolute_angle_and_cleans_up(bot,
 
 
 def test_increment_reads_then_validates_and_uses_configured_angle_command(bot):
-    args=parse('servo increment S4 15 --type 270 --home 90 --min-angle 30 --max-angle 150 --seconds .001',bot)
+    args=parse('servo positional increment S4 15 --type 270 --home 90 --min-angle 30 --max-angle 150 --seconds .001',bot)
     with bench(args) as b: b.execute(hw.validate(args))
     assert bot.frames()[1:4]==[b'\x22\x10\x01',b'\x27\x10',b'\x24\x10\x00\x69']
-    args=parse('servo increment S4 100 --type 270 --home 90 --max-angle 150 --seconds .001',bot)
+    args=parse('servo positional increment S4 100 --type 270 --home 90 --max-angle 150 --seconds .001',bot)
     before=len(bot.frames())
     with bench(args) as b:
         with pytest.raises(ValueError,match='safe limits'): b.execute(hw.validate(args))
@@ -142,7 +152,7 @@ def test_increment_reads_then_validates_and_uses_configured_angle_command(bot):
 @pytest.mark.parametrize('failure',['reject','drop'])
 def test_failed_registration_never_configures_or_moves(bot,failure):
     getattr(bot,failure).add(0x41)
-    args=parse('servo angle S0 90 --type 180 --home 90',bot)
+    args=parse('servo positional angle S0 90 --type 180 --home 90',bot)
     with bench(args) as b:
         with pytest.raises((RuntimeError,TimeoutError)): b.execute(hw.validate(args))
     assert bot.frames()==[b'\x41test!',b'\x42']
@@ -151,10 +161,10 @@ def test_failed_registration_never_configures_or_moves(bot,failure):
 @pytest.mark.parametrize('failure',['drop','wrong','malformed','reject'])
 def test_bad_reply_stops_session_without_motion_retry(bot,failure):
     getattr(bot,failure).add(0x24)
-    args=parse('servo angle S2 120 --type 180 --home 90 --seconds .001',bot)
+    args=parse('servo positional angle S2 120 --type 180 --home 90 --seconds .001',bot)
     with bench(args) as b:
         with pytest.raises((RuntimeError,TimeoutError)): b.execute(hw.validate(args))
-        with pytest.raises(RuntimeError): b.execute(hw.validate(parse('servo speed S0 10 --seconds .001',bot)))
+        with pytest.raises(RuntimeError): b.execute(hw.validate(parse('servo continuous speed S0 10 --seconds .001',bot)))
     assert sum(p==b'\x24\x04\x00\x78' for p in bot.frames())==1
     assert not any(p[0]==0x23 and p[2] for p in bot.frames())
     assert bot.frames()[-3:]==[b'\x28',b'\x24\x04\x00\x5a',b'\x42']
@@ -162,7 +172,7 @@ def test_bad_reply_stops_session_without_motion_retry(bot,failure):
 
 def test_uncertain_continuous_type_is_individually_zeroed_before_dc_stop_and_unregister(bot):
     bot.drop.add(0x22)
-    args=parse('servo speed S5 -25 --seconds .001',bot)
+    args=parse('servo continuous speed S5 -25 --seconds .001',bot)
     with bench(args) as b:
         with pytest.raises(TimeoutError): b.execute(hw.validate(args))
     assert bot.frames()[-3:]==[b'\x23\x20\x00',b'\x28',b'\x42']
@@ -170,7 +180,7 @@ def test_uncertain_continuous_type_is_individually_zeroed_before_dc_stop_and_unr
 
 
 def test_continuous_speed_is_timed_heartbeat_independent_and_interruption_stops(bot,monkeypatch):
-    args=parse('servo speed S5 -25 --seconds .09',bot)
+    args=parse('servo continuous speed S5 -25 --seconds .09',bot)
     with bench(args) as b:
         b.execute(hw.validate(args))
         assert bot.frames()[-2:]==[b'\x23\x20\x00',b'\x28']
@@ -184,12 +194,48 @@ def test_continuous_speed_is_timed_heartbeat_independent_and_interruption_stops(
     assert bot.frames()[-3:]==[b'\x23\x20\x00',b'\x28',b'\x42']
 
 
+def test_seconds_holds_continuous_speed_past_default_lease(bot, capsys):
+    args = parse('servo continuous speed s0 100 --seconds 1.1', bot)
+    with bench(args) as b:
+        b.execute(args)
+    start = next(t for t,p in bot.packets if p == b'\x23\x01\x64')
+    end = next(t for t,p in bot.packets if t > start and p == b'\x23\x01\x00')
+    assert 1.1 <= end-start < 1.6
+    assert sum(p == b'\x23\x01\x64' for _,p in bot.packets) == 1
+    assert sum(p == b'\x43' for t,p in bot.packets if start <= t <= end) >= 30
+    assert not b.cleanup_errors
+    assert 'command held s' in capsys.readouterr().out
+
+
+def test_motion_wait_reports_the_actual_watchdog_reason(bot):
+    args = parse('servo continuous speed s0 100 --seconds 10', bot)
+    with bench(args) as b:
+        b.connect()
+        b.transport.fault_reason = 'Heartbeat sender gap 75 ms exceeded 50 ms; stop/home attempted'
+        b.transport.fault.set()
+        with pytest.raises(RuntimeError, match='Heartbeat sender gap 75 ms'):
+            b.wait(args.seconds)
+
+
+def test_stop_failure_does_not_hide_the_original_motion_error(bot, monkeypatch):
+    args = parse('servo continuous speed s0 100 --seconds 10', bot)
+    with bench(args) as b:
+        def failed_wait(seconds):
+            bot.reject.add(0x23)
+            raise RuntimeError('Heartbeat sender gap 75 ms exceeded 50 ms')
+        monkeypatch.setattr(b, 'wait', failed_wait)
+        with pytest.raises(RuntimeError, match='Heartbeat sender gap 75 ms'):
+            b.execute(args)
+    assert any('zero continuous servo S0' in error for error in b.cleanup_errors)
+    assert bot.frames()[-1] == b'\x42'
+
+
 def test_multiple_continuous_cleanup_and_retyping_positionals(bot):
-    args=parse('servo type S0 continuous',bot)
+    args=parse('servo continuous configure S0',bot)
     with bench(args) as b:
         b.execute(hw.validate(args))
-        b.execute(hw.validate(parse('servo type S4 continuous',bot)))
-        b.execute(hw.validate(parse('servo type S0 180 --home 90',bot)))
+        b.execute(hw.validate(parse('servo continuous configure S4',bot)))
+        b.execute(hw.validate(parse('servo positional configure S0 --type 180 --home 90',bot)))
         assert b.continuous=={4}
         bot.drop.add(0x23)
     assert bot.frames()[-4:]==[b'\x23\x10\x00',b'\x28',b'\x24\x01\x00\x5a',b'\x42']
@@ -197,7 +243,7 @@ def test_multiple_continuous_cleanup_and_retyping_positionals(bot):
 
 
 @pytest.mark.parametrize('command,frame',[
-    ('motor speed M4 -20 --seconds .001',b'\x21\x08\xec'),
+    ('dc-motor speed M4 -20 --seconds .001',b'\x21\x08\xec'),
     ('led set L0 L4 --rgb 10 20 30 --brightness 64',b'\x51\x11\x0a\x14\x1e\x40'),
     ('led off L2',b'\x52\x04'),('led board set 2 --rgb 1 2 3 --brightness 4',b'\x31\x02\x01\x02\x03\x04'),
     ('led board off 1',b'\x32\x01'),('screen app-info',b'\x63\x01'),('screen next',b'\x61'),
@@ -212,8 +258,8 @@ def test_output_and_configuration_frames(bot,command,frame):
 
 
 @pytest.mark.parametrize('command,key',[
-    ('ping','pong'),('name','loopback'),('battery','battery percent'),('servo read S0 S5','DEG (commanded)'),
-    ('motor read M1 M4','% (commanded)'),('led read L0 L4','BRIGHTNESS'),('led board read','no board LED readings'),
+    ('ping','pong'),('name','loopback'),('battery','battery percent'),('servo positional read S0 S5','DEG (commanded)'),
+    ('dc-motor read M1 M4','% (commanded)'),('led read L0 L4','BRIGHTNESS'),('led board read','no board LED readings'),
     ('sensor imu read','X mg'),('sensor imu config','rate hz'),('sensor imu bump config','threshold mg'),
     ('sensor huskylens algorithm','learned id count'),('sensor huskylens controls','illumination supported'),
     ('sensor lidar read','8x64 mm'), ('sensor lidar intensity read --seconds .1','8x64 raw'),
@@ -271,12 +317,15 @@ def test_bump_without_impact_is_not_transport_failure(bot,capsys):
 
 
 @pytest.mark.parametrize('command',[
-    'servo angle S6 90 --type 180 --home 90','servo angle S0 181 --type 180 --home 90','servo angle S0 20',
-    'servo angle S0 20 --type 180 --home 90 --min-angle 30','servo speed S0 101',
-    'motor speed M0 10','motor speed M5 10','motor speed M1 1 --seconds nan',
-    'motor speed M1 1 --seconds 0','led set L5 --rgb 0 0 0',
+    'servo positional angle S6 90 --type 180 --home 90','servo positional angle S0 181 --type 180 --home 90','servo positional angle S0',
+    'servo positional angle S0 20 --type 180 --home 90 --min-angle 30','servo continuous speed S0 101',
+    'dc-motor speed M0 10','dc-motor speed M5 10','dc-motor speed M1 1 --seconds nan',
+    'dc-motor speed M1 1 --seconds 0','led set L5 --rgb 0 0 0',
     'sensor lidar watch --hz 9', 'sensor lidar intensity watch --hz 9',
     'sensor imu bump watch --hz 401', 'sound play ../bad.wav',
+    'servo positional speed S0 20', 'servo continuous angle S0 45',
+    'servo continuous configure S0 --home 0', 'servo continuous speed M1 20',
+    'dc-motor speed S0 20', 'servo positional configure S0 --type continuous',
 ])
 def test_invalid_values_fail_before_sockets(command,monkeypatch):
     monkeypatch.setattr(socket,'socket',lambda *a,**k:pytest.fail('Invalid input opened a socket'))
@@ -287,10 +336,10 @@ def test_invalid_values_fail_before_sockets(command,monkeypatch):
 def test_dry_run_never_prompts_or_connects(monkeypatch,capsys):
     monkeypatch.setattr(socket,'socket',lambda *a,**k:pytest.fail('Dry run opened socket'))
     monkeypatch.setattr(hw,'private_token',lambda:pytest.fail('Dry run prompted for token'))
-    args=parse('servo angle S3 90 --type 270 --home 90',dry=True)
+    args=parse('servo positional angle S3 90 --type 270 --home 90',dry=True)
     hw.run(args)
     text=capsys.readouterr().out
-    assert 'DRY RUN: SERVO ANGLE' in text and 'request.home' in text and '90' in text
+    assert 'DRY RUN: SERVO POSITIONAL ANGLE' in text and 'request.home' in text and '90' in text
 
 
 @pytest.mark.parametrize('command,model', [
@@ -341,7 +390,7 @@ def test_private_token_nonterminal_rejected_without_exposure(monkeypatch):
 
 
 def test_readback_wrong_echoed_mask_poisons_session(bot,monkeypatch):
-    args=parse('servo read S0',bot)
+    args=parse('servo positional read S0',bot)
     with bench(args) as b:
         b.connect()
         monkeypatch.setattr(b.transport,'request',lambda *a,**k:b'\x27\x00\x02\x00\x5a')
@@ -394,7 +443,7 @@ def test_sound_http_operations_register_first(http_bot,bot,monkeypatch,tmp_path)
 
 
 def test_timed_motion_stops_before_output_can_block(bot,monkeypatch):
-    args=parse('servo speed S2 10 --seconds .001',bot)
+    args=parse('servo continuous speed S2 10 --seconds .001',bot)
     def blocked_output(value):
         assert bot.frames()[-2:]==[b'\x23\x04\x00',b'\x28']
         raise BrokenPipeError('closed output')
@@ -426,8 +475,8 @@ def test_watch_output_failure_still_disables_streams_and_unregisters(bot,monkeyp
 
 
 def test_shell_prompts_once_and_recovers_from_invalid_command(bot,monkeypatch,capsys):
-    lines=iter(['servo angle S0 999 --type 180 --home 90','servo type S0 continuous',
-                'servo angle S1 90 --type 180 --home 90 --seconds .001','exit'])
+    lines=iter(['servo positional angle S0 999 --type 180 --home 90','servo continuous configure S0',
+                'servo positional angle S1 90 --type 180 --home 90 --seconds .001','exit'])
     def prompt(text):
         assert bot.frames()[0]==b'\x41test!'
         return next(lines)
@@ -445,7 +494,7 @@ def test_shell_prompts_once_and_recovers_from_invalid_command(bot,monkeypatch,ca
 
 
 def test_shell_help_accepts_unix_flags_and_help_command(bot,monkeypatch,capsys):
-    lines=iter(['help servo angle', 'sensor imu configure -h', 'servo speed --help',
+    lines=iter(['help servo positional angle', 'sensor imu configure -h', 'servo continuous speed --help',
                 'help sensor imu bump', 'sensor lidar intensity read --help',
                 'sensor huskylens controls -h', 'led board set --help', 'exit'])
     monkeypatch.setattr('builtins.input',lambda prompt:next(lines))
@@ -454,6 +503,20 @@ def test_shell_help_accepts_unix_flags_and_help_command(bot,monkeypatch,capsys):
     hw.run(parse('shell',bot))
     captured=capsys.readouterr()
     assert captured.out.count('usage:')==7
-    assert captured.out.count('Example:')==7
+    assert captured.out.count('EXAMPLE:')==7
     assert not captured.err
     assert bot.frames()==[b'\x41test!',b'\x28',b'\x42']
+
+
+def test_shell_recovers_from_unsafe_increment_without_reregistering(bot, monkeypatch, capsys):
+    lines = iter(['servo positional increment S0 100 --max-angle 100',
+                  'servo positional angle S0 45 --seconds .001', 'exit'])
+    monkeypatch.setattr('builtins.input', lambda prompt:next(lines))
+    monkeypatch.setattr('sys.stdin.isatty', lambda:True)
+    monkeypatch.setattr(hw, 'private_token', lambda:'test!')
+    hw.run(parse('shell', bot))
+    captured = capsys.readouterr()
+    assert 'safe limits' in captured.err and 'Example:' in captured.err
+    assert sum(p[0] == 0x41 for p in bot.frames()) == 1
+    assert b'\x24\x01\x00\x2d' in bot.frames()
+    assert bot.frames()[-2:] == [b'\x24\x01\x00\x00', b'\x42']

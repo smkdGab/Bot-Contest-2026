@@ -5,11 +5,13 @@ Connect your computer to the K10's Wi-Fi and use the IP shown on its display.
 
 ```bash
 python -m botticelli hardware --host YOUR_BOT_IP shell
-python -m botticelli hardware --dry-run servo angle S0 45 --type 180 --home 90
+python -m botticelli hardware --dry-run servo positional angle S0 45
 ```
 
-See [CLI.md](CLI.md) for commands. In the shell, use `help servo angle` or
-`servo angle --help`; `exit` closes the session.
+See [CLI.md](CLI.md) for commands. In the shell, use `help servo positional angle` or
+`servo positional angle --help`; `exit` closes the session.
+Positional commands default to type 270 and home 0. Use `servo continuous` for
+continuous servos on S0..S5, and `dc-motor` for DC motors on M1..M4.
 
 ## Before motion
 
@@ -29,6 +31,8 @@ Cleanup sends speed zero individually to configured continuous servos, then
 best-effort `STOP_ALL_MOTORS`, homes explicitly configured positional servos,
 disables streams and unregisters. Servo reads do not infer a type or home.
 Ctrl+C, SIGTERM and exceptions follow this path; cleanup failures are reported.
+An unconfirmed step names the operation, channel, action code and reply error.
+An earlier stop error is cleared only after a later stop for that channel is acknowledged.
 
 **Network stopping is not a physical guarantee.** Motion leases attempt stop/home
 commands when control stalls, but SIGKILL, computer power loss or lost Wi-Fi can

@@ -21,8 +21,8 @@ def printed(data, *, width=80, full=True):
 
 
 @pytest.mark.parametrize('data,labels', [
-    ({'test':'servo read', 'commanded_degrees':{'S0':90,'S5':135}}, ('CHANNEL','DEG (commanded)','S0','S5','135')),
-    ({'test':'motor read', 'commanded_percent':{'M1':-25}}, ('M1','% (commanded)','-25')),
+    ({'test':'servo positional read', 'commanded_degrees':{'S0':90,'S5':135}}, ('CHANNEL','DEG (commanded)','S0','S5','135')),
+    ({'test':'dc-motor read', 'commanded_percent':{'M1':-25}}, ('M1','% (commanded)','-25')),
     ({'leds':{'L4':dict(red=12,green=23,blue=34,brightness=45)}}, ('L4','RED','GREEN','BLUE','BRIGHTNESS','45')),
     ({'leds':'3 K10 RGB LEDs and 2 expansion LEDs'}, ('leds','3 K10 RGB LEDs','2 expansion LEDs')),
     ({'board_leds':{'leds':[dict(id=2,red=12,green=23,blue=34,brightness=45)],'extra':9}}, ('BOARD LEDS','ID','2','extra','9')),

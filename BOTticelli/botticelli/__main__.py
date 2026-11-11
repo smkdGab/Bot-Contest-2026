@@ -1,5 +1,4 @@
 """CLI entry point. Hardware access is confined to explicit drive/bench commands."""
-import argparse
 from dataclasses import replace
 import math
 from pathlib import Path
@@ -177,38 +176,32 @@ def run_battle(args):
 
 
 def build_parser():
-    parser = Parser(prog='python -m botticelli',
-        description='K10 hardware control and offline driving practice.',
-        epilog='Example: python -m botticelli hardware --host YOUR_BOT_IP shell\nHelp: COMMAND --help. See CLI.md.')
+    parser = Parser(prog='python -m botticelli', description='K10 hardware control and offline driving practice.')
     commands = parser.add_subparsers(dest="command", required=True)
     from .hardware import add_parser
     add_parser(commands)
     default_config = str(Path(__file__).resolve().parent.parent / "config" / "bot.yaml")
-    check = command(commands, 'gamepad-check', 'Inspect gamepad input offline; close the window to exit.',
-                    'python -m botticelli gamepad-check')
+    check = command(commands, 'gamepad-check', 'Inspect gamepad input offline; close the window to exit.')
     check.add_argument("--config", default=default_config, help='gamepad configuration YAML')
     check.set_defaults(run=gamepad_check)
-    control = command(commands, 'drive', 'Drive with a gamepad: hold A to enable, release A to stop. Real mode prompts for the TFT token.',
-                      'python -m botticelli drive --backend sim')
+    control = command(commands, 'drive', 'Drive with a gamepad: hold A to enable, release A to stop. Real mode prompts for the TFT token.')
     control.add_argument("--backend", choices=("sim", "real"), default='sim', help='simulation or K10 hardware')
     control.add_argument("--config", default=default_config, help='vehicle and hardware configuration YAML')
-    control.add_argument("--record", metavar="SESSION.jsonl", help='create a new recording; existing files are not overwritten')
+    control.add_argument("--record", metavar="FILE", help='create a new JSONL recording; existing files are not overwritten')
     control.add_argument("--headless", action="store_true", help='offline simulation without a window; requires --seconds')
     control.add_argument("--seconds", type=float, help="bounded run, at most 3600 seconds")
     control.add_argument("--screenshot", help="save a dashboard image at the end of a bounded simulation")
     control.set_defaults(run=drive)
-    battle = command(commands, 'battle', 'Run an offline balloon battle. Enter starts, Space pauses, R creates a new round.',
-                     'python -m botticelli battle --opponents 3 --seed 42')
+    battle = command(commands, 'battle', 'Run an offline balloon battle. Enter starts, Space pauses, R creates a new round.')
     battle.add_argument("--config", help="separate battle YAML configuration")
     battle.add_argument("--opponents", type=int, help='number of opponents, 1..32; otherwise use YAML')
     battle.add_argument("--seed", type=int, help='repeat a generated setup; otherwise generate a seed')
-    battle.add_argument("--record", metavar="BATTLE.jsonl", help='create a new battle recording')
+    battle.add_argument("--record", metavar="FILE", help='create a new battle JSONL recording')
     battle.add_argument("--headless", action="store_true", help='run all cars by policy without a window; requires --seconds')
     battle.add_argument("--seconds", type=float, help='duration limit in (0, 3600] seconds')
     battle.add_argument("--screenshot", help='save the final window image of a bounded run')
     battle.set_defaults(run=run_battle)
-    viewer = command(commands, 'replay', 'View a recording offline; recorded commands are never sent to hardware.',
-                     'python -m botticelli replay recordings/session.jsonl --headless')
+    viewer = command(commands, 'replay', 'View a recording offline; recorded commands are never sent to hardware.')
     viewer.add_argument("path", help='JSONL recording to read')
     viewer.add_argument("--headless", action="store_true", help='validate the recording and print a summary without a window')
     viewer.set_defaults(run=replay)
