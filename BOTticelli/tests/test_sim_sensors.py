@@ -4,7 +4,7 @@ import math
 import pytest
 
 from botticelli.config import Config, Arena, Box
-from botticelli.sim_sensors import SimSensors
+from botticelli.simulation import SimSensors
 
 
 def readings(model, pose, t, collision=False, opponent=(1, 2, 0)):

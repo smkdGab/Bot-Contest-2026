@@ -36,6 +36,21 @@ def test_every_command_has_offline_unix_help(path, flag, monkeypatch, capsys):
     assert 'usage:' in captured.out and '-h, --help' in captured.out
     if path:
         assert 'Example:' in captured.out
+    if path[:2] == ('hardware', 'sensor') and len(path) >= 3 and path[2] != 'all':
+        model = {'lidar':'SEN0682', 'imu':'LIS2DW12', 'compass':'BMM350', 'huskylens':'HuskyLens'}[path[2]]
+        assert model in captured.out
+    if path[:2] in (('hardware', 'servo'), ('hardware', 'motor'), ('hardware', 'led')):
+        assert 'DFR1216' in captured.out
+
+
+def test_commands_group_views_under_their_physical_devices():
+    paths = set(command_paths(build_parser()))
+    assert {p[2] for p in paths if p[:2] == ('hardware', 'sensor') and len(p) == 3} == {
+        'lidar', 'imu', 'compass', 'huskylens', 'all'}
+    assert ('hardware', 'sensor', 'imu', 'bump', 'watch') in paths
+    assert ('hardware', 'sensor', 'lidar', 'intensity', 'read') in paths
+    assert ('hardware', 'led', 'board', 'read') in paths
+    assert ('hardware', 'board-led') not in paths
 
 
 def test_servo_help_explains_units_home_and_limits(capsys):

@@ -29,7 +29,7 @@ def printed(data, *, width=80, full=True):
     ({'sounds':['beep.wav','start.wav'],'free_bytes':1000000,'playing':False}, ('FILE','beep.wav','start.wav','free bytes','1000000','no')),
     ({'sensor':'imu','frame_id':123,'accel_mg':[1,-2,1000]}, ('IMU','frame 123','X mg','Y mg','Z mg','-2','1000')),
     ({'sensor':'compass','frame_id':44,'heading_deg':270,'field_ut':[1,-2,45]}, ('COMPASS','frame 44','HEADING deg','270','X uT','Y uT','Z uT')),
-    ({'sensor':'bump','frame_id':23,'direction':1,'accel_mg':[100,200,1000]}, ('BUMP','frame 23','impact 1 X+','1000')),
+    ({'sensor':'bump','frame_id':23,'direction':1,'accel_mg':[100,200,1000]}, ('IMU / IMPACTS','frame 23','impact 1 X+','1000')),
     ({'sensor':'bump','state':'NO EVENTS','events_received':0,'seconds':5}, ('NO EVENTS','events received','0','seconds','5')),
 ])
 def test_tables_preserve_values_without_json_or_ansi(data, labels):
@@ -38,6 +38,19 @@ def test_tables_preserve_values_without_json_or_ansi(data, labels):
     assert data == original
     for label in labels: assert label in text
     assert '\x1b' not in text and not text.lstrip().startswith('{')
+
+
+@pytest.mark.parametrize('name,model,title', [
+    ('lidar', 'DFRobot SEN0682 64x8 DTOF LiDAR', 'LIDAR'),
+    ('intensity', 'DFRobot SEN0682 64x8 DTOF LiDAR', 'LIDAR / INTENSITY'),
+    ('imu', 'DFRobot SEN0409 LIS2DW12 accelerometer', 'IMU'),
+    ('bump', 'DFRobot SEN0409 LIS2DW12 accelerometer', 'IMU / IMPACTS'),
+    ('compass', 'DFRobot SEN0619 BMM350 magnetometer', 'COMPASS'),
+    ('camera', 'DFRobot SEN0305 HuskyLens K210', 'HUSKYLENS'),
+])
+def test_sensor_headers_identify_the_physical_device(name, model, title):
+    text = printed(dict(sensor=name, device=model, state='WAITING'), width=120)
+    assert title in text and text.count(model) == 1
 
 
 def test_camera_shows_all_block_and_arrow_fields():
@@ -145,3 +158,41 @@ def test_forced_color_on_a_pipe_does_not_enable_cursor_updates(monkeypatch):
         view.update({'imu':dict(sensor='imu',accel_mg=[1,2,3])})
         assert view.live is None
     assert '\x1b' not in stream.getvalue()
+
+
+def test_color_heatmap_and_cell_probe_keep_exact_measurements(monkeypatch):
+    monkeypatch.setenv('TERM','xterm-256color')
+    monkeypatch.delenv('NO_COLOR',raising=False)
+    stream=TTY()
+    console=Console(file=stream,width=80,height=40,force_terminal=True,color_system='truecolor',record=True)
+    values=[1000]*512
+    values[0],values[1],values[2],values[3]=0,99,400,5000
+    with Watch(console=console,cell=(0,3)) as view:
+        view.update({'lidar':dict(sensor='lidar',distance_mm=values)})
+    raw=stream.getvalue()
+    plain=console.export_text()
+    assert '48;2;' in raw  # true-color background tiles
+    assert 'Closest in-range: 0.400 m (400 mm) at row 0, col 2' in plain
+    assert 'Cell row 0, col 3: 5.000 m (5000 mm)' in plain
+    assert 'below 1' in plain and 'CAUTION' in plain
+    assert '\x1b[?1049' not in raw
+
+
+def test_no_color_disables_tiles_but_keeps_measurements(monkeypatch):
+    monkeypatch.setenv('NO_COLOR','1')
+    stream=TTY()
+    console=Console(file=stream,width=80,height=40,force_terminal=True,color_system='truecolor',record=True)
+    with Watch(console=console) as view:
+        view.update({'lidar':dict(sensor='lidar',distance_mm=[400]*512)})
+    assert '48;2;' not in stream.getvalue()
+    text=console.export_text()
+    assert '@'*64 in text
+    assert 'Closest in-range: 0.400 m' in text
+
+
+def test_unknown_ranges_never_produce_a_false_closest_distance():
+    data=dict(sensor='lidar',distance_mm=[0,99,65535,0]*128)
+    text=printed(data,full=False)
+    assert 'Closest in-range: UNKNOWN' in text
+    assert 'below 128' in text and 'above 128' in text
+    assert 'CAUTION' in text

@@ -1,14 +1,161 @@
-"""IR-SIM Ackermann dynamics and collision detection, without its renderer."""
+"""Offline IR-SIM dynamics, matrix raycasting and synthetic sensors."""
 import math
 import tempfile
 import time
 
+import numpy as np
 import yaml
 
-from .config import Config
-from .control import DriveCommand, map_command
-from .lidar import Observation, RayCaster
-from .sim_sensors import SimSensors
+from .config import Config, Lidar
+from .control import DriveCommand, Observation, map_command
+from .protocol import LidarFrame, SensorReading
+
+
+class RayCaster:
+    def __init__(self, config: Lidar, boxes):
+        self.config = config
+        self.rng = np.random.default_rng(config.seed)
+        # Cell centers: top row first, left to right. Physical sensor orientation is uncalibrated.
+        horizontal = np.deg2rad((0.5 - (np.arange(64) + 0.5)/64) * config.horizontal_deg)
+        vertical = np.deg2rad((0.5 - (np.arange(8) + 0.5)/8) * config.vertical_deg)
+        az, el = np.meshgrid(horizontal, vertical)
+        rays = np.stack([np.cos(el)*np.cos(az), np.cos(el)*np.sin(az), np.sin(el)], axis=-1).reshape(-1, 3)
+        pitch = math.radians(config.tilt_deg)
+        # Positive pitch lifts the forward beam.
+        cp, sp = math.cos(pitch), math.sin(pitch)
+        rays = rays @ np.array([[cp, 0, sp], [0, 1, 0], [-sp, 0, cp]])
+        yaw = math.radians(config.yaw_deg)
+        cy, sy = math.cos(yaw), math.sin(yaw)
+        self.rays = rays @ np.array([[cy, sy, 0], [-sy, cy, 0], [0, 0, 1]])
+        # Prepare constant bounds once, rather than rebuilding geometry for each scan.
+        self.bounds = [(np.array([b.x-b.length/2, b.y-b.width/2, 0]),
+                        np.array([b.x+b.length/2, b.y+b.width/2, b.height])) for b in boxes]
+        self.frame_id = 0
+
+    @staticmethod
+    def intersections(origin, directions, lower, upper):
+        # Slab ray/box test, vectorized over all 512 rays.
+        parallel = np.abs(directions) < 1e-12
+        safe = np.where(parallel, 1, directions)
+        t1, t2 = (lower-origin)/safe, (upper-origin)/safe
+        near = np.where(parallel, -np.inf, np.minimum(t1, t2)).max(axis=1)
+        far = np.where(parallel, np.inf, np.maximum(t1, t2)).min(axis=1)
+        outside = (parallel & ((origin < lower) | (origin > upper))).any(axis=1)
+        return np.where((far >= np.maximum(near, 0)) & ~outside, np.maximum(near, 0), np.inf)
+
+    def scan(self, pose, now: float, sim_time: float, opponent=None, opponent_size=None):
+        c = self.config
+        if self.rng.random() < c.drop_probability:
+            return None
+        x, y, yaw = pose
+        co, si = math.cos(yaw), math.sin(yaw)
+        rotate = np.array([[co, si, 0], [-si, co, 0], [0, 0, 1]])
+        directions = self.rays @ rotate
+        origin = np.array([x + co*c.x - si*c.y, y + si*c.x + co*c.y, c.height])
+        dz = directions[:, 2]
+        nearest = np.full(512, np.inf)
+        np.divide(-c.height, dz, out=nearest, where=dz < -1e-12)
+        for lower, upper in self.bounds:
+            nearest = np.minimum(nearest, self.intersections(origin, directions, lower, upper))
+        if opponent is not None:
+            ox, oy, angle = opponent
+            co, si = math.cos(angle), math.sin(angle)
+            inverse = np.array([[co, -si, 0], [si, co, 0], [0, 0, 1]])
+            local_origin = (origin - np.array([ox, oy, 0])) @ inverse
+            length, width, height = opponent_size
+            nearest = np.minimum(nearest, self.intersections(
+                local_origin, directions @ inverse,
+                np.array([-length/2, -width/2, 0]), np.array([length/2, width/2, height])))
+        valid = (nearest >= c.minimum) & (nearest <= c.maximum)
+        if c.noise_std:
+            nearest[valid] += self.rng.normal(0, c.noise_std, np.count_nonzero(valid))
+            nearest[valid] = np.clip(nearest[valid], c.minimum, c.maximum)
+        values = np.zeros(512, dtype=np.uint16)  # 0 means no valid return in this approximation
+        values[valid] = np.rint(nearest[valid]*1000).astype(np.uint16)
+        frame = LidarFrame(self.frame_id, round(sim_time*1000), now, tuple(int(v) for v in values))
+        self.frame_id = (self.frame_id + 1) & 0xFFFF
+        return frame
+
+
+class SimSensors:
+    def __init__(self, config):
+        self.config = config
+        self.previous = None
+        self.velocity = 0
+        self.percent = config.arena.battery_percent
+        self.readings = {}
+        self.next_frame = 0
+        self.frame_id = 0
+        self.last_collision = False
+        self.bounds = RayCaster(config.lidar, config.arena.boxes()).bounds
+
+    def update(self, pose, opponent, collision, sim_time, now):
+        velocity = yaw_rate = acceleration = 0.0
+        if self.previous is not None:
+            old_pose, old_time = self.previous
+            dt = sim_time-old_time
+            if dt > 0:
+                velocity = ((pose[0]-old_pose[0])*math.cos(old_pose[2])+
+                            (pose[1]-old_pose[1])*math.sin(old_pose[2]))/dt
+                delta_yaw = math.atan2(math.sin(pose[2]-old_pose[2]), math.cos(pose[2]-old_pose[2]))
+                yaw_rate = delta_yaw/dt
+                acceleration = (velocity-self.velocity)/dt
+                fraction = abs(velocity)/max(0.01, self.config.car.max_speed*self.config.arena.drive_speed_scale)
+                self.percent = max(0, self.percent-(2+8*fraction)*dt/3600/self.config.arena.battery_wh*100)
+        accel = [round(acceleration/9.80665*1000), round(velocity*yaw_rate/9.80665*1000), 1000]
+        if collision and not self.last_collision:
+            self.readings["bump"] = SensorReading("bump", now, dict(frame_id=self.frame_id,
+                direction=1 if self.velocity >= 0 else 0, accel_mg=accel))
+        self.previous = (pose, sim_time)
+        self.velocity = velocity
+        self.readings["motion"] = SensorReading("motion", now, {"velocity_mps": velocity})
+        self.last_collision = collision
+        self.readings["imu"] = SensorReading("imu", now, dict(frame_id=round(sim_time*1000), accel_mg=accel))
+        if sim_time+1e-9 < self.next_frame:
+            return tuple(self.readings.values())
+        self.next_frame = sim_time+0.1
+        self.frame_id += 1
+        heading = (90-math.degrees(pose[2])) % 360
+        self.readings.update({
+            "compass": SensorReading("compass", now, dict(frame_id=self.frame_id,
+                heading_deg=round(heading)%360,
+                field_ut=[round(20*math.sin(pose[2])), round(20*math.cos(pose[2])), 45])),
+            "battery": SensorReading("battery", now, {"percent": round(self.percent, 2)}),
+            "vision": SensorReading("vision", now, self.vision(pose, opponent)),
+        })
+        return tuple(self.readings.values())
+
+    def vision(self, pose, opponent):
+        c, a = self.config.lidar, self.config.arena
+        co, si = math.cos(pose[2]), math.sin(pose[2])
+        origin = np.array([pose[0]+co*c.x-si*c.y, pose[1]+si*c.x+co*c.y, c.height])
+        targets = [(opponent[0], opponent[1], a.opponent_width, a.opponent_height, 1, None)]
+        targets += [(b.x, b.y, max(b.length, b.width), b.height, i+2, i)
+                    for i, b in enumerate(a.obstacles)]
+        blocks = []
+        focal = 160/math.tan(math.radians(30))
+        for x, y, width, height, identity, own_index in targets:
+            delta = np.array([x, y, height/2])-origin
+            forward = co*delta[0]+si*delta[1]
+            lateral = -si*delta[0]+co*delta[1]
+            if forward <= 0.1:
+                continue
+            distance = float(np.linalg.norm(delta))
+            if distance > c.maximum:
+                continue
+            direction = (delta/distance).reshape(1, 3)
+            occluded = any(float(RayCaster.intersections(origin, direction, low, high)[0]) < distance-0.01
+                           for index, (low, high) in enumerate(self.bounds) if index != own_index)
+            if occluded:
+                continue
+            cx, cy = 160-focal*lateral/forward, 120-focal*delta[2]/forward
+            w, h = focal*width/forward, focal*height/forward
+            left, right = max(0, cx-w/2), min(320, cx+w/2)
+            top, bottom = max(0, cy-h/2), min(240, cy+h/2)
+            if right > left and bottom > top:
+                blocks.append([round((left+right)/2), round((top+bottom)/2),
+                               max(1, round(right-left)), max(1, round(bottom-top)), identity, 100])
+        return dict(frame_id=self.frame_id, width=320, height=240, blocks=blocks[:8], arrows=[])
 
 
 class Simulation:

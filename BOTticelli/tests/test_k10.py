@@ -8,7 +8,8 @@ import pytest
 
 from botticelli.config import Config, Hardware
 from botticelli.control import DriveCommand
-from botticelli.k10 import K10, K10Transport
+from botticelli.control import K10
+from botticelli.protocol import K10Transport
 
 
 def lidar_packet(frame_id=3, values=None):

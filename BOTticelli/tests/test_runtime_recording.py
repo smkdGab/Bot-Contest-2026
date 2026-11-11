@@ -9,9 +9,9 @@ import pytest
 from botticelli.__main__ import replay
 from botticelli.config import Config
 from botticelli.control import DriveCommand, Input
-from botticelli.lidar import Observation
+from botticelli.control import Observation
 from botticelli.recording import Recorder, read
-from botticelli.runtime import Driver
+from botticelli.control import Driver
 
 
 class Backend:

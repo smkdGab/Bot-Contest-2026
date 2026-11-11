@@ -6,8 +6,8 @@ from pathlib import Path
 import sys
 import time
 
-from .safety import private_token, termination_cleanup, finish_cleanup
-from .cli import command
+from .primitives import private_token, termination_cleanup, finish_cleanup
+from .hardware import command
 
 
 @termination_cleanup()
@@ -24,12 +24,12 @@ def drive(args):
     if args.screenshot and (args.headless or args.backend != "sim" or args.seconds is None):
         raise ValueError("Screenshot checks require a bounded, windowed simulation")
     if args.backend == "real":
-        from .k10 import K10
+        from .control import K10
         backend = K10(config, private_token())
     else:
         from .simulation import Simulation
         backend = Simulation(config)
-    from .runtime import Driver
+    from .control import Driver
     recorder = Recorder(args.record, config, args.backend) if args.record else None
     dashboard = None
     driver = Driver(backend, config, recorder)
@@ -109,7 +109,7 @@ def replay(args):
         return
     import pygame
     from .dashboard import Dashboard
-    from .lidar import Observation
+    from .control import Observation
     dashboard = Dashboard(config, "BOTticelli / OFFLINE REPLAY")
     command, observation, state = DriveCommand(), Observation(), "Replay"
     start = time.monotonic()
@@ -140,7 +140,7 @@ def gamepad_check(args):
     from .config import load
     import pygame
     from .dashboard import GamepadReader
-    from .gamepad_check import CheckWindow
+    from .dashboard import CheckWindow
     from .display import Watch
     config = load(args.config)
     dashboard = CheckWindow(config.gamepad)

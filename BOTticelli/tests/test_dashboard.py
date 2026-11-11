@@ -2,12 +2,12 @@ from dataclasses import replace
 from types import SimpleNamespace
 
 import pygame
+import pytest
 
 from botticelli.config import Config, Gamepad
-from botticelli.control import DriveCommand
+from botticelli.control import DriveCommand, Observation
 from botticelli.dashboard import Dashboard, GamepadReader
-from botticelli.lidar import LidarFrame, Observation
-from botticelli.sensors import SensorReading
+from botticelli.protocol import LidarFrame, SensorReading
 
 
 def test_dashboard_fresh_stale_and_unknown_pose(tmp_path):
@@ -96,5 +96,51 @@ def test_dashboard_renders_real_telemetry_and_stale_state(monkeypatch):
         labels.clear()
         dashboard.draw(Observation(sensors=readings), DriveCommand(), "Ready", now=11, source="REAL")
         assert any("STALE" in label for label in labels)
+    finally:
+        dashboard.close()
+
+
+@pytest.mark.parametrize('size',[(1440,960),(720,480),(1900,960),(1440,1200),(1001,1001)])
+def test_lidar_hover_preserves_all_coordinates_through_resize_and_letterboxing(size):
+    dashboard=Dashboard(Config())
+    try:
+        dashboard.window=pygame.display.set_mode(size,pygame.RESIZABLE)
+        view=dashboard.viewport()
+        for row in range(8):
+            for col in range(64):
+                x=96+(col+.5)*12
+                y=785+(row+.5)*10
+                position=(int(view.x+x*view.width/1440),int(view.y+y*view.height/960))
+                assert dashboard.lidar_cell(position)==(row,col)
+        assert dashboard.lidar_cell((0,0)) is None
+        assert dashboard.lidar_cell((size[0]-1,size[1]-1)) is None
+    finally:
+        dashboard.close()
+
+
+@pytest.mark.parametrize('mm,expected',[(400,'0.400 m (400 mm)'),(0,'NO RETURN (0 mm)'),(99,'OUT OF RANGE (99 mm)'),(65535,'OUT OF RANGE (65535 mm)')])
+def test_lidar_hover_shows_exact_value_and_stale_status(monkeypatch,mm,expected):
+    dashboard=Dashboard(Config())
+    values=[1000]*512
+    values[3*64+17]=mm
+    frame=LidarFrame(1,1234,10,tuple(values))
+    monkeypatch.setattr(pygame.mouse,'get_focused',lambda:True)
+    monkeypatch.setattr(pygame.mouse,'get_pos',lambda:(96+17*12+6,785+3*10+5))
+    labels=[]
+    draw_text=dashboard.text
+    def collect(text,*args,**kwargs):
+        labels.append(str(text)); draw_text(text,*args,**kwargs)
+    monkeypatch.setattr(dashboard,'text',collect)
+    try:
+        dashboard.draw(Observation(lidar=frame),DriveCommand(),'Ready',now=10.1)
+        assert dashboard.selected==(3,17)
+        assert any('CELL r3 c17' in text and expected in text for text in labels)
+        labels.clear()
+        dashboard.draw(Observation(lidar=frame),DriveCommand(),'Ready',now=11)
+        assert 'STALE' in labels
+        assert dashboard.heatmap.get_alpha()==90
+        dashboard.draw(Observation(),DriveCommand(),'Ready',now=11)
+        assert dashboard.selected is None and dashboard.nearest is None
+        assert dashboard.heatmap_key is None
     finally:
         dashboard.close()

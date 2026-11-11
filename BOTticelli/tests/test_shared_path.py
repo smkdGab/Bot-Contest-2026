@@ -3,8 +3,7 @@ from dataclasses import replace
 import pytest
 
 from botticelli.config import Arena, Lidar
-from botticelli.control import DrivingRules, Input, map_command
-from botticelli.k10 import K10
+from botticelli.control import DrivingRules, Input, K10, map_command
 from botticelli.simulation import Simulation
 from test_k10 import Bot, config
 

@@ -4,9 +4,9 @@ import time
 
 import pytest
 
-from botticelli.k10 import K10
-from botticelli.sensors import decode_sensor
-from botticelli.lidar import Observation
+from botticelli.control import K10
+from botticelli.protocol import decode_sensor
+from botticelli.control import Observation
 from botticelli.recording import observation_from_dict
 from test_k10 import bot, config
 

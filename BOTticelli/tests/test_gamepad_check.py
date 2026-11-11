@@ -1,5 +1,5 @@
-from botticelli.gamepad_check import Checklist
-from botticelli.gamepad_check import CheckWindow
+from botticelli.dashboard import Checklist
+from botticelli.dashboard import CheckWindow
 from botticelli.config import Gamepad
 from botticelli.control import Input
 from types import SimpleNamespace

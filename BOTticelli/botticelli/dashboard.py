@@ -5,6 +5,7 @@ import time
 import pygame
 
 from .control import Input
+from .display import range_color, distance, closest
 
 
 class GamepadReader:
@@ -55,6 +56,7 @@ class GamepadReader:
 
 
 class Dashboard:
+    LIDAR_GRID = pygame.Rect(96, 785, 768, 80)
     BG = (9, 13, 19)
     PANEL = (17, 23, 32)
     LINE = (35, 44, 57)
@@ -66,7 +68,7 @@ class Dashboard:
 
     def __init__(self, config, title="BOTticelli"):
         from collections import deque
-        from .lidar import RayCaster
+        from .simulation import RayCaster
         pygame.display.init()
         pygame.font.init()
         self.window = pygame.display.set_mode((1440, 960), pygame.RESIZABLE)
@@ -85,6 +87,7 @@ class Dashboard:
         self.heatmap.fill((27, 35, 46))
         self.heatmap_key = None
         self.nearest = None
+        self.closest_cell = None
         self.selected = None
         self.vehicle_cache = {}
         self.imu_history = deque(maxlen=100)
@@ -154,6 +157,23 @@ class Dashboard:
         if reading is None: return "OFFLINE", self.MUTED
         if "error" in reading.values: return "UNAVAILABLE", self.AMBER
         return ("LIVE", self.TEAL) if 0 <= now-reading.received_at <= limit else ("STALE", self.AMBER)
+
+    def viewport(self):
+        width, height = self.window.get_size()
+        ratio = min(width/1440, height/960)
+        return pygame.Rect(0, 0, max(1, round(1440*ratio)), max(1, round(960*ratio))).move(
+            (width-max(1, round(1440*ratio)))//2, (height-max(1, round(960*ratio)))//2)
+
+    def lidar_cell(self, position):
+        """Convert actual window pixels through letterboxing to wire row/column."""
+        view = self.viewport()
+        if not view.collidepoint(position):
+            return None
+        x, y = (position[0]-view.x)*1440/view.width, (position[1]-view.y)*960/view.height
+        grid = self.LIDAR_GRID
+        if grid.left <= x < grid.right and grid.top <= y < grid.bottom:
+            return int((y-grid.y)*8/grid.height), int((x-grid.x)*64/grid.width)
+        return None
 
     def draw(self, observation, command, state, now=None, source="SIM", controller=""):
         now = time.monotonic() if now is None else now
@@ -296,26 +316,50 @@ class Dashboard:
         self.text("DETECTIONS",1252,617,self.MUTED,self.small)
         self.text(" / ".join(str(b[4]) for b in blocks) or "—",1252,661,self.TEAL,self.small)
 
-        self.panel((24,728,912,208),"LIDAR", f"{l.hz} HZ" if observation.lidar else "OFFLINE")
         frame=observation.lidar
+        fresh = frame is not None and frame.fresh(now, l.stale_seconds)
+        self.panel((24,728,912,208),"LIDAR / SENSOR RANGE", f"{l.hz} HZ" if fresh else "STALE" if frame else "OFFLINE")
+        self.text('gray: no return   pink X: out of range', 350, 747, self.MUTED, self.small)
         if frame is not None and (frame.frame_id,frame.received_at)!=self.heatmap_key:
-            valid=[]
             for index,mm in enumerate(frame.values_mm):
-                if l.minimum*1000 <= mm <= l.maximum*1000:
-                    f=(mm/1000-l.minimum)/(l.maximum-l.minimum)
-                    col=(round(241-172*f),round(179+34*f),round(106+135*f))
-                    valid.append(mm/1000)
-                else: col=(27,35,46)
+                col=range_color(mm, l.minimum*1000, l.maximum*1000)
                 pygame.draw.rect(self.heatmap,col,((index%64)*12,(index//64)*10,12,10))
-            self.nearest=min(valid) if valid else None
+                if mm and not l.minimum*1000 <= mm <= l.maximum*1000:
+                    x, y = (index%64)*12, (index//64)*10
+                    pygame.draw.line(self.heatmap, self.INK, (x+3,y+2), (x+8,y+7))
+                    pygame.draw.line(self.heatmap, self.INK, (x+8,y+2), (x+3,y+7))
+            match = closest(frame.values_mm, l.minimum*1000, l.maximum*1000)
+            self.nearest = match[0]/1000 if match else None
+            self.closest_cell = divmod(match[1], 64) if match else None
             self.heatmap_key=(frame.frame_id,frame.received_at)
+        if frame is None:
+            self.heatmap.fill(range_color(0))
+            self.heatmap_key = self.nearest = self.closest_cell = None
+        self.heatmap.set_alpha(255 if fresh or frame is None else 90)
         self.screen.blit(self.heatmap,(96,785))
-        self.text("L",51,815,self.MUTED,self.small)
-        self.text("R",889,815,self.MUTED,self.small)
+        self.text("r0",61,785,self.MUTED,self.small)
+        self.text("r7",61,852,self.MUTED,self.small)
+        self.text("c0",96,766,self.MUTED,self.small)
+        self.text("c63",835,766,self.MUTED,self.small)
+        for i in range(200):
+            pygame.draw.line(self.screen, range_color((l.minimum+(l.maximum-l.minimum)*i/199)*1000,
+                l.minimum*1000, l.maximum*1000), (310+i,769), (310+i,776))
+        self.text(f"{l.minimum:g}m near",234,766,self.MUTED,self.small)
+        self.text(f"{l.maximum:g}m far",520,766,self.MUTED,self.small)
+        self.selected = self.lidar_cell(pygame.mouse.get_pos()) if frame and pygame.mouse.get_focused() else None
+        if self.selected is not None:
+            row, col = self.selected
+            pygame.draw.rect(self.screen, self.INK, (96+col*12,785+row*10,12,10), 2)
+            mm = frame.values_mm[row*64+col]
+            label = f"CELL r{row} c{col}   {distance(mm, l.minimum*1000, l.maximum*1000)}"
+            self.text(label,46,908,self.INK if fresh else self.AMBER,self.small)
+        else:
+            self.text("Hover a cell for row, column and distance" if frame else "Waiting for LiDAR data",46,908,self.MUTED,self.small)
         age=now-frame.received_at if frame else None
-        self.text(f"{self.nearest:.2f} M" if frame and self.nearest is not None else "—",46,892,self.TEAL)
-        self.text(f"{age*1000:.0f} MS" if age is not None else "OFFLINE",730,895,self.MUTED,self.small)
-        self.text("LIVE" if frame and frame.fresh(now,l.stale_seconds) else "STALE",828,895,self.TEAL if frame and frame.fresh(now,l.stale_seconds) else self.AMBER,self.small)
+        nearest = f"NEAREST IN RANGE {self.nearest:.3f} m  r{self.closest_cell[0]} c{self.closest_cell[1]}" if self.nearest is not None else "NEAREST IN RANGE —"
+        self.text(nearest,46,880,self.TEAL if fresh else self.MUTED)
+        self.text(f"{age*1000:.0f} MS" if age is not None else "OFFLINE",730,880,self.MUTED,self.small)
+        self.text("LIVE" if fresh else "STALE" if frame else "OFFLINE",828,880,self.TEAL if fresh else self.AMBER,self.small)
         self.panel((956,770,460,166),"DRIVE")
         motion = sensors.get("motion")
         speed = abs(motion.values["velocity_mps"]) if motion else None
@@ -324,15 +368,102 @@ class Dashboard:
         self.text("R" if command.throttle<0 else "D" if command.throttle>0 else "N",1318,807,self.TEAL,font=self.metric)
         pygame.draw.rect(self.screen,self.LINE,(978,899,416,5),border_radius=2)
         pygame.draw.rect(self.screen,self.TEAL,(978,899,round(416*abs(command.throttle)),5),border_radius=2)
-        size=self.window.get_size()
-        ratio=min(size[0]/1440,size[1]/960)
-        output=pygame.transform.smoothscale(self.screen,(max(1,round(1440*ratio)),max(1,round(960*ratio))))
+        viewport = self.viewport()
+        output=pygame.transform.smoothscale(self.screen,viewport.size)
         self.window.fill(self.BG)
-        self.window.blit(output,output.get_rect(center=self.window.get_rect().center))
+        self.window.blit(output,viewport)
         pygame.display.flip()
 
     def save(self,path):
         pygame.image.save(self.screen,str(path))
+
+    def close(self):
+        pygame.quit()
+
+
+class Checklist:
+    def __init__(self):
+        self.buttons = []
+        self.axes = []
+        self.hats = []
+
+    def update(self, buttons, axes, hats):
+        if len(self.buttons) != len(buttons):
+            self.buttons = [[False, False] for _ in buttons]
+        if len(self.axes) != len(axes):
+            self.axes = [[False, False] for _ in axes]
+        if len(self.hats) != len(hats):
+            self.hats = [set() for _ in hats]
+        for history, pressed in zip(self.buttons, buttons):
+            if pressed:
+                history[0] = True
+            elif history[0]:
+                history[1] = True
+        for history, value in zip(self.axes, axes):
+            history[0] |= value < -0.7
+            history[1] |= value > 0.7
+        for history, (x, y) in zip(self.hats, hats):
+            if x: history.add((x, 0))
+            if y: history.add((0, y))
+
+
+class CheckWindow:
+    def __init__(self, config):
+        pygame.display.init()
+        pygame.font.init()
+        self.screen = pygame.display.set_mode((960, 720))
+        pygame.display.set_caption("BOTticelli / Gamepad checklist")
+        self.font = pygame.font.Font(None, 24)
+        self.title = pygame.font.Font(None, 36)
+        self.config = config
+        self.history = Checklist()
+        self.generation = None
+
+    def text(self, value, x, y, passed=False, title=False):
+        color = (92, 218, 175) if passed else (219, 229, 237)
+        self.screen.blit((self.title if title else self.font).render(value, True, color), (x, y))
+
+    def draw(self, reader, sample):
+        if self.generation != sample.generation:
+            self.history = Checklist()
+            self.generation = sample.generation
+        self.screen.fill((16, 25, 33))
+        self.text("Gamepad checklist", 30, 22, title=True)
+        self.text(reader.message, 30, 65)
+        self.text("Press and release A. Test the named driving controls and active D-pad directions.", 30, 100)
+        if not sample.connected:
+            self.text("Connect a controller to begin.", 30, 160)
+        else:
+            j = getattr(reader, "joystick", None)
+            axes = ([j.get_axis(self.config.throttle_axis)*self.config.throttle_sign,
+                     j.get_axis(self.config.steering_axis)*self.config.steering_sign] if j is not None
+                    else [sample.throttle, sample.steering])
+            triggers = self.config.throttle_mode == "triggers"
+            if triggers and j is not None:
+                axes[0] = (j.get_axis(self.config.forward_trigger_axis)-j.get_axis(self.config.reverse_trigger_axis))/2
+            hats = [j.get_hat(self.config.hat)] if self.config.dpad and j is not None and j.get_numhats() > self.config.hat else []
+            self.history.update([sample.a], axes, hats)
+            done = all(self.history.buttons[0])
+            self.text(f"{'[OK]' if done else '[  ]'} A - hold to drive, release to stop: "
+                      f"{'PRESSED' if sample.a else 'released'}", 30, 170, done)
+            throttle, steering = self.history.axes
+            directions = [("RT - forward" if triggers else "Up - forward", throttle[1]),
+                          ("LT - reverse" if triggers else "Down - reverse", throttle[0]),
+                          ("Left - steer left", steering[1]), ("Right - steer right", steering[0])]
+            self.text("Triggers / Left stick" if triggers else "Left stick", 30, 235, title=True)
+            for row, (label, complete) in enumerate(directions):
+                self.text(f"{'[OK]' if complete else '[  ]'} {label}", 30, 285+row*45, complete)
+            if self.config.dpad:
+                self.text("D-pad", 510, 235, title=True)
+                seen = self.history.hats[0] if self.history.hats else set()
+                for row, (label, direction) in enumerate(zip(
+                        ("Up - forward", "Down - reverse", "Left - steer left", "Right - steer right"),
+                        ((0, 1), (0, -1), (-1, 0), (1, 0)))):
+                    self.text(f"{'[OK]' if direction in seen else '[  ]'} {label}", 510, 285+row*45, direction in seen)
+            self.text(f"Throttle {sample.throttle:+.2f}   Steering {sample.steering:+.2f}", 30, 520)
+            self.text("Completed checks stay green until the controller reconnects.", 30, 570)
+        self.text("Driving: hold A to move, release A to stop. Stick may be moved before A. Close to exit.", 30, 685)
+        pygame.display.flip()
 
     def close(self):
         pygame.quit()

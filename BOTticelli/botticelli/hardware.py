@@ -12,24 +12,41 @@ import sys
 import time
 
 from .primitives import Robot, STREAMS, ALGORITHMS, SCREENS, servo_limits, filename, wav_bytes
-from .safety import termination_cleanup
-from .cli import command
+from .primitives import private_token, termination_cleanup
 
 
 STATUS = {1:'invalid parameters', 2:'invalid values', 3:'operation failed / device unsupported',
           4:'service not started', 5:'unknown service', 6:'unknown command', 7:'not master'}
-CAPABILITIES = {
-    'servo': 'S0..S5: positional angle or continuous speed',
-    'motor': 'M1..M4: speed and stop',
-    'battery': 'Charge level, 0..100 percent',
-    'lidar': '64x8 distance and intensity scans; streaming',
-    'compass': 'Heading and magnetic field; streaming',
-    'imu': 'Acceleration, bump events, configuration and streaming',
-    'huskylens': 'Detections, algorithm selection, learned IDs and streaming',
-    'leds': '3 K10 RGB LEDs and 2 expansion LEDs; color and brightness',
-    'display': 'K10 TFT screen selection',
-    'sound': 'Stored WAV files: list, upload, delete, play, stop, status and volume',
+SENSOR_NAMES = {
+    'lidar': 'DFRobot SEN0682 64x8 DTOF LiDAR',
+    'imu': 'DFRobot SEN0409 LIS2DW12 accelerometer',
+    'compass': 'DFRobot SEN0619 BMM350 magnetometer',
+    'camera': 'DFRobot SEN0305 HuskyLens K210',
 }
+SENSOR_NAMES['intensity'] = SENSOR_NAMES['lidar']
+SENSOR_NAMES['bump'] = SENSOR_NAMES['imu']
+CAPABILITIES = {
+    'servo': 'DFRobot DFR1216: S0..S5 positional angle or continuous speed',
+    'motor': 'DFRobot DFR1216: M1..M4 speed and stop',
+    'battery': 'DFRobot DFR1216: charge level, 0..100 percent',
+    'lidar': SENSOR_NAMES['lidar'] + ': distance, intensity and streaming',
+    'compass': SENSOR_NAMES['compass'] + ': heading, magnetic field and streaming',
+    'imu': SENSOR_NAMES['imu'] + ': acceleration, bump events and configuration',
+    'huskylens': SENSOR_NAMES['camera'] + ': detections, algorithms and streaming',
+    'leds': 'UniHiker K10: 3 NeoPixels; DFR1216: 2 WS2812 LEDs',
+    'display': 'UniHiker K10: TFT screen selection',
+    'sound': 'UniHiker K10 speaker: stored WAV files, playback and volume',
+}
+
+
+def command(commands, name, summary, example, *, device=None):
+    parser = commands.add_parser(name, help=summary,
+        description=f'{device}: {summary}' if device else summary,
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        epilog='Example: ' + example)
+    if device:
+        parser.set_defaults(device_name=device)
+    return parser
 
 
 def output(value):
@@ -39,7 +56,7 @@ def output(value):
 
 def requested(args):
     hidden = {'run', 'upload', 'command', 'component', 'action', 'host', 'port', 'http_port',
-              'timeout', 'geomag_rate_format', 'dry_run', 'full'}
+              'timeout', 'geomag_rate_format', 'dry_run', 'full', 'sensor', 'device_name', 'view', 'board'}
     values = {k:v for k,v in vars(args).items() if k not in hidden and v is not None}
     prefix = {'servo':'S', 'motor':'M', 'led':'L'}.get(args.component)
     if prefix:
@@ -89,26 +106,63 @@ def finite_seconds(text):
     return value
 
 
+def add_sensor_commands(root, name, path):
+    device = SENSOR_NAMES.get(name, 'All documented sensors')
+    root.set_defaults(sensor=name, device_name=device)
+    actions = root.add_subparsers(dest='action', required=True)
+    for verb in ('watch',) if name in ('bump', 'all') else ('read', 'watch'):
+        p = command(actions, verb, 'Read one fresh sample as a table or color heatmap.' if verb == 'read' else
+            'Watch readings in this terminal; pipes receive plain snapshots.', path+' '+verb, device=device)
+        p.add_argument('--seconds', type=finite_seconds, default=5. if verb=='watch' else 2., help='watch duration or streamed-read deadline, in (0, 60] seconds')
+        p.add_argument('--hz', type=integer_between(1,400), default=8 if name in ('lidar','intensity','camera','all') else 10, help='stream rate: LiDAR <=8, HuskyLens <=20, compass <=50, IMU <=400 Hz; unused for direct IMU/LiDAR reads')
+        p.set_defaults(full=False, cell=None)
+        if name in ('lidar', 'intensity', 'all'):
+            p.add_argument('--full', action='store_true', help='show all 512 exact values in numbered grids')
+            p.add_argument('--cell', nargs=2, type=int, metavar=('ROW','COL'), help='inspect row 0..7, column 0..63')
+    if name=='imu':
+        command(actions, 'config', 'Read acceleration configuration.', path+' config', device=device)
+        command(actions, 'reset', 'Reset acceleration configuration; does not reboot the K10.', path+' reset', device=device)
+        p = command(actions, 'configure', 'Write raw acceleration settings; confirm codes supported by your device.', path+' configure --range-code 1 --rate-hz 100 --power-code 0 --hpf-code 1', device=device)
+        p.add_argument('--range-code', type=integer_between(0,255), required=True, help='raw range code, 0..255')
+        p.add_argument('--rate-hz', type=integer_between(1,65535), required=True, help='sampling rate in Hz; device may reject unsupported values')
+        p.add_argument('--power-code', type=integer_between(0,255), required=True, help='raw power mode code, 0..255')
+        p.add_argument('--hpf-code', type=integer_between(0,255), required=True, help='raw high-pass filter code, 0..255')
+    elif name=='bump':
+        command(actions, 'config', 'Read impact threshold and debounce interval.', path+' config', device=device)
+        p = command(actions, 'configure', 'Set impact threshold and debounce interval.', path+' configure --threshold-mg 500 --debounce-ms 100', device=device)
+        p.add_argument('--threshold-mg', type=integer_between(0,65535), required=True, help='acceleration threshold in mg')
+        p.add_argument('--debounce-ms', type=integer_between(0,65535), required=True, help='minimum interval between events in milliseconds')
+    elif name=='camera':
+        command(actions, 'algorithm', 'Read algorithm and learned-ID count.', path+' algorithm', device=device)
+        p = command(actions, 'set-algorithm', 'Select an algorithm; training is done on the sensor.', path+' set-algorithm color', device=device)
+        p.add_argument('algorithm', choices=ALGORITHMS, help='algorithm name')
+        command(actions, 'controls', 'Read control state and support flags.', path+' controls', device=device)
+        p = command(actions, 'illumination', 'Switch illumination on or off.', path+' illumination on', device=device)
+        p.add_argument('state', choices=('on','off'), help='illumination state')
+    return actions
+
+
 def add_components(parser, *, shell=True):
     groups = parser.add_subparsers(dest='component', required=True)
     for name, summary in (('capabilities', 'List usable hardware features from the contest documentation; offline.'),
                           ('ping', 'Check the K10 connection with a matched ping reply.'),
-                          ('name', 'Read the K10 name.'), ('battery', 'Read battery charge in percent.')):
+                          ('name', 'Read the K10 name.'), ('battery', 'Read DFR1216 battery charge in percent.')):
         command(groups, name, summary, 'python -m botticelli hardware ' +
-                (name if name == 'capabilities' else '--host YOUR_BOT_IP ' + name))
+                (name if name == 'capabilities' else '--host YOUR_BOT_IP ' + name),
+                device='DFRobot DFR1216' if name == 'battery' else 'UniHiker K10')
     if shell:
         command(groups, 'shell', 'Register once and run commands interactively. Use help COMMAND, exit or Ctrl+C.',
-                'python -m botticelli hardware --host YOUR_BOT_IP shell')
+                'python -m botticelli hardware --host YOUR_BOT_IP shell', device='UniHiker K10')
     stop = command(groups, 'stop', 'Stop DC motors and explicitly selected continuous servos; best-effort network stop.',
-                   'stop --continuous S0 S4')
+                   'stop --continuous S0 S4', device='DFRobot DFR1216')
     stop.add_argument('--continuous', nargs='+', type=channel('S',6), default=[], help='known continuous channels S0..S5 to zero individually')
     for name in ('servo','motor'):
-        root = command(groups, name, 'Control servos S0..S5.' if name == 'servo' else 'Control DC motors M1..M4.', name+' read '+('S0' if name == 'servo' else 'M1'))
+        root = command(groups, name, 'Control DFR1216 servos S0..S5.' if name == 'servo' else 'Control DFR1216 DC motors M1..M4.', name+' read '+('S0' if name == 'servo' else 'M1'), device='DFRobot DFR1216')
         actions = root.add_subparsers(dest='action', required=True)
         example_channel = 'S0' if name == 'servo' else 'M1'
-        read = command(actions, 'read', 'Read commanded values; this is not physical encoder feedback.', name+' read '+example_channel)
+        read = command(actions, 'read', 'Read commanded values; this is not physical encoder feedback.', name+' read '+example_channel, device='DFRobot DFR1216')
         read.add_argument('channels', nargs='+', type=channel('S',6) if name=='servo' else channel('M',4,1), help='servo S0..S5' if name == 'servo' else 'motor M1..M4')
-        speed = command(actions, 'speed', 'Run a timed speed test, then stop. Servo channels are configured as continuous.', name+' speed '+example_channel+' 15 --seconds 1')
+        speed = command(actions, 'speed', 'Run a timed speed test, then stop. Servo channels are configured as continuous.', name+' speed '+example_channel+' 15 --seconds 1', device='DFRobot DFR1216')
         speed.add_argument('channel', type=channel('S',6) if name=='servo' else channel('M',4,1), help='servo S0..S5' if name == 'servo' else 'motor M1..M4')
         speed.add_argument('value', type=integer_between(-100,100), help='signed speed percent')
         speed.add_argument('--seconds', type=finite_seconds, default=1., help='default 1; maximum 60')
@@ -119,7 +173,7 @@ def add_components(parser, *, shell=True):
                     'increment': ('Add degrees to the reported commanded angle; reject targets outside safe limits.', 'servo increment S0 10 --type 180 --home 90'),
                     'type': ('Configure a servo type. Positional types require --home; continuous servos stop with speed zero.', 'servo type S0 180 --home 90'),
                 }[name2]
-                action = command(actions, name2, summary, example)
+                action = command(actions, name2, summary, example, device='DFRobot DFR1216')
                 action.add_argument('channel', type=channel('S',6), help='servo channel S0..S5')
                 if name2=='type':
                     action.add_argument('value', choices=('180','270','continuous'))
@@ -130,50 +184,41 @@ def add_components(parser, *, shell=True):
                 action.add_argument('--home', type=integer_between(0,270), help='required safe home for positional servos')
                 action.add_argument('--min-angle', type=integer_between(0,270), default=0, help='safe lower endpoint in degrees')
                 action.add_argument('--max-angle', type=integer_between(0,270), help='safe upper endpoint in degrees; otherwise servo type maximum')
-    for name in ('led','board-led'):
-        actions = command(groups, name, 'Control unified LEDs L0..L4.' if name == 'led' else 'Control board LEDs by index 0..2.', name+' read'+(' L0' if name == 'led' else '')).add_subparsers(dest='action', required=True)
+    led = command(groups, 'led', 'Control K10 NeoPixels and DFR1216 WS2812 LEDs.', 'led read L0 L3', device='UniHiker K10 / DFRobot DFR1216')
+    led.set_defaults(board=False)
+    led_actions = led.add_subparsers(dest='action', required=True)
+    board = command(led_actions, 'board', 'Use the DFR1216 board LED service, indexes 0..2.', 'led board read', device='DFRobot DFR1216')
+    board.set_defaults(board=True)
+    for board_mode, actions, path, device in (
+            (False, led_actions, 'led', 'UniHiker K10 NeoPixels / DFR1216 WS2812 LEDs'),
+            (True, board.add_subparsers(dest='action', required=True), 'led board', 'DFRobot DFR1216')):
         for verb in ('set','read','off'):
-            example = name+' '+verb+(' L0' if name == 'led' else ' 0' if verb != 'read' else '')+(' --rgb 255 0 0' if verb == 'set' else '')
-            p = command(actions, verb, {'set':'Set RGB color and brightness.', 'read':'Read LED state.', 'off':'Turn selected LEDs off.'}[verb], example)
-            if name=='led':
-                p.add_argument('channels', nargs='+', type=channel('L',5), help='LED channels L0..L4')
+            example = path+' '+verb+(' L0' if not board_mode else ' 0' if verb != 'read' else '')+(' --rgb 255 0 0' if verb == 'set' else '')
+            p = command(actions, verb, {'set':'Set RGB color and brightness.', 'read':'Read LED state.', 'off':'Turn selected LEDs off.'}[verb], example, device=device)
+            if not board_mode:
+                p.add_argument('channels', nargs='+', type=channel('L',5), help='L0..L2: K10 NeoPixels; L3/L4: DFR1216 WS2812 LEDs')
             elif verb!='read':
                 p.add_argument('index', type=integer_between(0,2), help='board LED index 0..2')
             if verb=='set':
                 p.add_argument('--rgb', nargs=3, type=integer_between(0,255), required=True, metavar=('R','G','B'), help='red, green, blue bytes, each 0..255')
                 p.add_argument('--brightness', type=integer_between(0,255), default=64, help='raw firmware brightness byte 0..255, default 64')
-    screen = command(groups, 'screen', 'Select a K10 TFT screen or move to the next/previous screen.', 'screen app-info')
+    screen = command(groups, 'screen', 'Select a K10 TFT screen or move to the next/previous screen.', 'screen app-info', device='UniHiker K10 TFT')
     screen.add_argument('screen', choices=(*SCREENS,'next','previous'), help='screen name or navigation direction')
-    sensor = command(groups, 'sensor', 'Read or configure a sensor; camera means HuskyLens detections, not images.', 'sensor imu read').add_subparsers(dest='sensor',required=True)
-    for name in ('lidar','intensity','imu','compass','camera','bump','all'):
-        units = {'lidar':'distance in millimetres', 'intensity':'raw LiDAR intensity', 'imu':'acceleration in mg', 'compass':'heading in degrees and field in microteslas', 'camera':'HuskyLens blocks and arrows', 'bump':'impact events; no event is normal', 'all':'all available sensor streams'}
-        actions = command(sensor, name, 'Inspect '+units[name]+'.', 'sensor '+name+' watch --seconds 5').add_subparsers(dest='action',required=True)
-        for verb in ('read','watch') if name not in ('bump','all') else ('watch',):
-            p = command(actions, verb, 'Read one fresh sample as a table or ASCII grid.' if verb == 'read' else 'Watch sensor tables and ASCII grids in this terminal; pipes receive plain snapshots.', 'sensor '+name+' '+verb)
-            p.add_argument('--seconds', type=finite_seconds, default=5. if verb=='watch' else 2., help='watch duration or streamed-read deadline, in (0, 60] seconds')
-            p.add_argument('--hz', type=integer_between(1,400), default=8 if name in ('lidar','intensity','camera','all') else 10, help='stream rate: LiDAR <=8, camera <=20, compass <=50, IMU <=400 Hz; unused for direct IMU/LiDAR reads')
-            p.add_argument('--full', action='store_true',help='show all 512 exact values in numbered ASCII grids instead of a compact ASCII intensity/distance map')
-        if name=='imu':
-            command(actions, 'config', 'Read the current IMU configuration.', 'sensor imu config')
-            command(actions, 'reset', 'Reset IMU configuration; does not reboot the K10.', 'sensor imu reset')
-            p = command(actions, 'configure', 'Write raw IMU settings. Confirm codes supported by your device.', 'sensor imu configure --range-code 1 --rate-hz 100 --power-code 0 --hpf-code 1')
-            p.add_argument('--range-code', type=integer_between(0,255),required=True, help='raw range code, 0..255')
-            p.add_argument('--rate-hz', type=integer_between(1,65535),required=True, help='sampling rate in Hz; device may reject unsupported values')
-            p.add_argument('--power-code', type=integer_between(0,255),required=True, help='raw power mode code, 0..255')
-            p.add_argument('--hpf-code', type=integer_between(0,255),required=True, help='raw high-pass filter code, 0..255')
-        if name=='bump':
-            command(actions, 'config', 'Read the bump threshold and debounce interval.', 'sensor bump config')
-            p = command(actions, 'configure', 'Set the impact threshold and debounce interval.', 'sensor bump configure --threshold-mg 500 --debounce-ms 100')
-            p.add_argument('--threshold-mg', type=integer_between(0,65535),required=True, help='acceleration threshold in mg')
-            p.add_argument('--debounce-ms', type=integer_between(0,65535),required=True, help='minimum interval between events in milliseconds')
-        if name=='camera':
-            command(actions, 'algorithm', 'Read the HuskyLens algorithm and learned-ID count.', 'sensor camera algorithm')
-            p = command(actions, 'set-algorithm', 'Select a HuskyLens algorithm; training is done on the sensor.', 'sensor camera set-algorithm color')
-            p.add_argument('algorithm',choices=ALGORITHMS, help='algorithm name')
-            command(actions, 'controls', 'Read HuskyLens control state and support flags.', 'sensor camera controls')
-            p = command(actions, 'illumination', 'Switch HuskyLens illumination on or off.', 'sensor camera illumination on')
-            p.add_argument('state',choices=('on','off'), help='illumination state')
-    sound = command(groups, 'sound', 'Manage stored PCM WAV files and playback over HTTP.', 'sound list').add_subparsers(dest='action',required=True)
+    sensor = command(groups, 'sensor', 'Read or configure sensors, grouped by physical device.', 'sensor imu read').add_subparsers(dest='device', required=True)
+    for name in ('lidar', 'imu', 'compass', 'huskylens', 'all'):
+        stream = 'camera' if name == 'huskylens' else name
+        device = SENSOR_NAMES.get(stream, 'All documented sensors')
+        path = 'sensor '+name
+        root = command(sensor, name, device+'.', path+' watch --seconds 5')
+        root.set_defaults(view='')
+        actions = add_sensor_commands(root, stream, path)
+        if name in ('lidar', 'imu'):
+            view = 'intensity' if name == 'lidar' else 'bump'
+            summary = 'Raw signal strength from this LiDAR.' if name == 'lidar' else 'Impact detection from this accelerometer; no event is normal.'
+            child = command(actions, view, summary, path+' '+view+' watch', device=device)
+            child.set_defaults(view=view)
+            add_sensor_commands(child, view, path+' '+view)
+    sound = command(groups, 'sound', 'Manage stored PCM WAV files and playback over HTTP.', 'sound list', device='UniHiker K10 speaker').add_subparsers(dest='action',required=True)
     for verb in ('list','status','stop','play','upload','delete','volume'):
         summary, example = {
             'list': ('List stored sound files.', 'sound list'), 'status': ('Read playback state and errors.', 'sound status'),
@@ -183,7 +228,7 @@ def add_components(parser, *, shell=True):
             'delete': ('Delete a stored WAV while playback is inactive.', 'sound delete beep.wav'),
             'volume': ('Set playback volume from 0 to 100 percent.', 'sound volume 25'),
         }[verb]
-        p = command(sound, verb, summary, example)
+        p = command(sound, verb, summary, example, device='UniHiker K10 speaker')
         if verb in ('play','upload','delete'):
             p.add_argument('filename',help='simple ASCII .wav filename stored on the bot')
         if verb=='upload':
@@ -193,7 +238,7 @@ def add_components(parser, *, shell=True):
 
 
 def add_parser(commands):
-    parser = command(commands, 'hardware', 'Test K10 components. Live sessions register once; help and dry-run are offline. Put connection options before the component command.', 'python -m botticelli hardware --host YOUR_BOT_IP shell')
+    parser = command(commands, 'hardware', 'Test K10 components. Live sessions register once; help and dry-run are offline. Put connection options before the component command.', 'python -m botticelli hardware --host YOUR_BOT_IP shell', device='UniHiker K10 / DFRobot DFR1216')
     parser.add_argument('--host',help='bot IP or hostname; no default live destination')
     parser.add_argument('--port', type=integer_between(1,65535),default=24642, help='K10 UDP port')
     parser.add_argument('--http-port', type=integer_between(1,65535),default=80, help='HTTP port for sound operations')
@@ -203,11 +248,6 @@ def add_parser(commands):
     add_components(parser)
     parser.set_defaults(run=run)
 
-
-
-def private_token():
-    from .safety import private_token as prompt
-    return prompt()
 
 
 def validate(args):
@@ -220,6 +260,9 @@ def validate(args):
         if a == 'angle' and not limits[1] <= args.value <= limits[2]:
             raise ValueError('Requested angle exceeds the configured safe range')
     if c == 'sensor' and a in ('read', 'watch'):
+        cell = getattr(args, 'cell', None)
+        if cell is not None and not (0 <= cell[0] < 8 and 0 <= cell[1] < 64):
+            raise ValueError('Cell must be row 0..7 and column 0..63')
         names = list(STREAMS) if args.sensor == 'all' else [args.sensor]
         if any(args.hz > STREAMS[n][2] for n in names):
             raise ValueError('Rate exceeds selected sensor limit')
@@ -255,16 +298,18 @@ class Bench(Robot):
 
     def execute(self, args):
         validate(args)
+        c, a = args.component, getattr(args, 'action', None)
+        label = ' '.join(filter(None, (c, getattr(args, 'device', ''), getattr(args, 'view', ''),
+            'board' if getattr(args, 'board', False) else '', a)))
+        device = getattr(args, 'device_name', 'UniHiker K10')
         if args.component == 'capabilities':
             output(CAPABILITIES)
             return
         if self.args.dry_run:
-            output(dict(test='dry run: '+args.component+' '+getattr(args, 'action', ''),
-                register=True, request=requested(args),
+            output(dict(test='dry run: '+label, device=device, register=True, request=requested(args),
                 cleanup='stop propulsion; home selected positional servos; disable streams; unregister'))
             return
         self.connect()
-        c, a = args.component, getattr(args, 'action', None)
         duration = getattr(args, 'seconds', 0) if c in ('servo', 'motor') else 0
         result = None
         try:
@@ -287,11 +332,11 @@ class Bench(Robot):
                         if a == 'speed':
                             self.servo_speed(args.channel, 0)
                         result = getattr(self, 'servo_'+a)(args.channel, args.value, ttl=min(60, duration+.1))
-            elif c in ('led', 'board-led'):
-                base = c.replace('-', '_')
-                channels = args.channels if c == 'led' else [args.index] if a != 'read' else []
+            elif c == 'led':
+                base = 'board_led' if args.board else 'led'
+                channels = [args.index] if args.board and a != 'read' else [] if args.board else args.channels
                 if a == 'set':
-                    result = getattr(self, base+'_set')(channels if c == 'led' else args.index, *args.rgb, args.brightness)
+                    result = getattr(self, base+'_set')(args.index if args.board else channels, *args.rgb, args.brightness)
                 else:
                     result = getattr(self, base+'_'+a)(*channels)
             elif c == 'screen':
@@ -302,7 +347,7 @@ class Bench(Robot):
                     result = getattr(self, 'read_'+s)()
                 elif a in ('read', 'watch'):
                     self.watch(dict(names=list(STREAMS) if s == 'all' else [s], hz=args.hz,
-                        seconds=args.seconds, once=a=='read', full=args.full))
+                        seconds=args.seconds, once=a=='read', full=args.full, cell=getattr(args, 'cell', None)))
                     return
                 elif s == 'imu':
                     if a == 'config': result = self.imu_config()
@@ -326,17 +371,17 @@ class Bench(Robot):
         finally:
             if duration:
                 self.stop()  # before potentially blocked console output
-        label = c+(' '+getattr(args, 'sensor') if c=='sensor' else '')+(' '+a if a else '')
         details = {'request':requested(args)} if not result or result.get('ok') else {}
         if c=='sensor' and a=='read':
-            details.update(sensor=args.sensor, _received_at=time.monotonic())
-        output({'test':label, **details, **(result or {'ok':True})})
+            details.update(sensor=args.sensor, _received_at=time.monotonic(),
+                           _cell=getattr(args, 'cell', None), _full=args.full)
+        output({'test':label, 'device':device, **details, **(result or {'ok':True})})
 
     def watch(self, options):
         from .display import Watch
         enabled, seen, received = [], {}, set()
-        records = {name:dict(sensor=name, state='WAITING') for name in options['names']}
-        view = Watch(full=options['full'] or options['once'])
+        records = {name:dict(sensor=name, device=SENSOR_NAMES[name], state='WAITING') for name in options['names']}
+        view = Watch(full=options['full'], cell=options.get('cell'))
         try:
             started = time.monotonic()
             for name in options['names']:
@@ -345,7 +390,7 @@ class Bench(Robot):
                 status = self.stream(name, hz=options['hz'], allow_status=True)
                 if status:
                     self.streams.pop(action, None)
-                    records[name] = dict(sensor=name, status=status, error=STATUS[status])
+                    records[name].update(state='REJECTED', status=status, error=STATUS[status])
                     if len(options['names']) == 1:
                         view.update(records)
                         raise RuntimeError('Sensor stream rejected')
@@ -363,7 +408,7 @@ class Bench(Robot):
                         values = dict(frame_id=reading.frame_id, timestamp_ms=reading.timestamp_ms,
                                       **{key:reading.values_mm})
                     else: values = reading.values
-                    record = dict(sensor=name, _received_at=reading.received_at, **values)
+                    record = dict(sensor=name, device=SENSOR_NAMES[name], _received_at=reading.received_at, **values)
                     if name == 'bump': record['events_seen'] = records[name].get('events_seen', 0)+1
                     records[name] = record
                 if time.monotonic() >= next_draw or options['once'] and received:
@@ -372,7 +417,7 @@ class Bench(Robot):
                 if options['once'] and received: break
                 self.transport.done.wait(.02)
             if not received and options['names'] == ['bump']:
-                records['bump'] = dict(sensor='bump', state='NO EVENTS', events_received=0, seconds=options['seconds'])
+                records['bump'].update(state='NO EVENTS', events_received=0, seconds=options['seconds'])
             for record in records.values():
                 if record.get('state') == 'WAITING': record['state'] = 'NO DATA'
             if not options['once'] or not received:

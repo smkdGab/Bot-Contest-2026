@@ -37,3 +37,14 @@ then hold A to drive; release it to stop.
 
 Run tests with `python -m pytest`. Tests use mocks and loopback; physical
 calibration and device compatibility still require hardware checks.
+
+## Code map
+
+| Files | Purpose |
+|---|---|
+| `protocol.py` → `primitives.py` | Validated packets, one receiver, heartbeat → small `Robot` operations and session cleanup; standard library only |
+| `control.py` | Driving rules, K10 adapter and control worker; hardware calls go through `Robot` |
+| `__main__.py`, `hardware.py` | CLI commands and interactive shell |
+| `display.py`, `dashboard.py` | Terminal tables, shared distance colors and pygame views |
+| `simulation.py`, `battle*.py` | Offline driving and battle practice |
+| `config.py`, `recording.py` | Validated settings and record/replay |

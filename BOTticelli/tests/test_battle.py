@@ -11,8 +11,8 @@ from shapely.geometry import Point
 
 from botticelli.battle import Battle
 from botticelli.battle_config import generate
-from botticelli.battle_geometry import Geometry, relative_hit, segment_blocked
-from botticelli.battle_policy import BattleObservation, Detection, HuntingPolicy
+from botticelli.battle import Geometry, relative_hit, segment_blocked
+from botticelli.battle import BattleObservation, Detection, HuntingPolicy
 from botticelli.battle_runtime import BattleSession, BattleWindow, replay_battle, run_battle
 from botticelli.control import DriveCommand, Input
 from botticelli.recording import Recorder, read
@@ -374,7 +374,7 @@ def test_other_car_occlusion_and_spectating_without_controller():
 
 
 def test_heading_wrap_uses_short_arc_and_sensing_keeps_eight_hz():
-    from botticelli.battle_geometry import interpolate_pose
+    from botticelli.battle import interpolate_pose
     pose=interpolate_pose([0,0,math.pi-.01],[0,0,-math.pi+.01],.5)
     assert pose[2]==pytest.approx(math.pi)
     w=Battle(setup())

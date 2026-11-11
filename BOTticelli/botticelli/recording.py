@@ -9,7 +9,8 @@ import threading
 import time
 
 from .config import Config
-from .lidar import LidarFrame, Observation
+from .protocol import LidarFrame
+from .control import Observation
 
 IR_SIM_REVISION = "96e3d6454dbb6a2bbedeee18bf77e685f4071d3d"
 
@@ -87,7 +88,7 @@ def read(path):
 
 def observation_from_dict(data):
     data = dict(data)
-    from .sensors import SensorReading
+    from .protocol import SensorReading
     data["sensors"] = tuple(SensorReading(**item) for item in data.get("sensors", []))
     if data.get("lidar") is not None:
         data["lidar"] = lidar_from_dict(data["lidar"])

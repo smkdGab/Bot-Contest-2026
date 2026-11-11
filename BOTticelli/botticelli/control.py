@@ -1,8 +1,21 @@
-"""Pure input safety rules and one calibration mapping. No backend imports."""
-from dataclasses import dataclass
+"""Driving observations, input rules and latest-only control over Robot primitives."""
+from dataclasses import asdict, dataclass
 import math
+import threading
+import time
 
 from .config import Car, Gamepad
+from .primitives import Robot
+from .protocol import LidarFrame, SensorReading
+
+
+@dataclass(frozen=True)
+class Observation:
+    pose: tuple[float, float, float] | None = None  # rear axle; simulation only
+    opponent: tuple[float, float, float] | None = None
+    collision: bool = False
+    lidar: LidarFrame | None = None
+    sensors: tuple[SensorReading, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -96,3 +109,177 @@ class DrivingRules:
                 ramp(throttle, self.command.throttle, self.config.acceleration_rate) if throttle else 0,
                 ramp(steering, self.command.steering, self.config.steering_rate))
         return self.command
+
+
+class K10(Robot):
+    """Driving adapter: calibration and observations built on Robot primitives."""
+    def __init__(self, config, token):
+        config.validate(real=True)
+        h = config.hardware
+        super().__init__(h.host, token, port=h.port, timeout=h.timeout)
+        self.config = config
+        self.command = DriveCommand()
+        self.next_battery = 0
+
+    def connect(self):
+        if self.registered:
+            return super().connect()
+        super().connect()
+        c = self.config.car
+        try:
+            self.configure_servo(c.drive_channel, 'continuous')
+            self.configure_servo(c.steering_channel, (180, 270)[c.steering_type],
+                home=int(c.steering_center), minimum=int(c.steering_min), maximum=int(c.steering_max))
+            self.stop()
+            if self.config.lidar.enabled:
+                self.stream('lidar', hz=self.config.lidar.hz)
+            if self.config.hardware.sensors_enabled:
+                for name, hz in (('imu', 10), ('compass', 10), ('camera', 8)):
+                    status = self.stream(name, hz=hz, allow_status=True)
+                    if status:
+                        key = 'vision' if name == 'camera' else name
+                        with self.transport.lock:
+                            self.transport.sensors[key] = SensorReading(key, time.monotonic(),
+                                {'error': f'Stream rejected: status {status}'})
+                self._battery()
+        except BaseException:
+            self.close()
+            raise
+
+    def apply(self, command, *, valid_until=float('inf')):
+        mapped = map_command(command, self.config.car)
+        c = self.config.car
+        if time.monotonic() > valid_until:
+            self.transport.fault.set()
+            raise TimeoutError('Input expired before servo write; discard command')
+        ttl = min(.5, max(.001, valid_until-time.monotonic()))
+        self.servo_angle(c.steering_channel, mapped.servo_angle, ttl=ttl)
+        if time.monotonic() > valid_until:
+            self.transport.fault.set()
+            raise TimeoutError('Input expired while awaiting steering ACK; discard propulsion')
+        self.servo_speed(c.drive_channel, mapped.speed_percent,
+                         ttl=min(.5, max(.001, valid_until-time.monotonic())))
+        self.command = command
+
+    def observe(self):
+        if self.transport.fault.is_set():
+            raise RuntimeError('K10 communication or heartbeat failed; session disabled')
+        if self.config.hardware.sensors_enabled and self.command.throttle == 0 and time.monotonic() >= self.next_battery:
+            self._battery()
+        with self.transport.lock:
+            return Observation(lidar=self.transport.lidar, sensors=tuple(self.transport.sensors.values()))
+
+    def _battery(self):
+        values = self.battery(optional=True)
+        if 'battery_percent' in values:
+            values = {'percent': values['battery_percent']}
+        with self.transport.lock:
+            self.transport.sensors['battery'] = SensorReading('battery', time.monotonic(), values)
+        self.next_battery = time.monotonic()+5
+
+    def stop(self):
+        self.command = DriveCommand(0, self.command.steering)
+        super().stop()
+
+
+class Driver:
+    def __init__(self, backend, config, recorder=None):
+        self.backend = backend
+        self.config = config
+        self.recorder = recorder
+        self.rules = DrivingRules(config.gamepad)
+        self.lock = threading.Lock()
+        self.sample = Input(time.monotonic())
+        self.observation = Observation()
+        self.command = DriveCommand()
+        self.state = self.rules.state
+        self.error = None
+        self.done = threading.Event()
+        self.connected = threading.Event()
+        self.wake = threading.Event()
+        self.thread = threading.Thread(target=self._run, name="actuator-driver", daemon=True)
+
+    def submit(self, sample: Input):
+        with self.lock:
+            self.sample = sample  # replacement, never a growing command queue
+        self.wake.set()  # read the latest press or release without waiting for the actuator deadline
+
+    def snapshot(self):
+        with self.lock:
+            return self.observation, self.command, self.state
+
+    def start(self):
+        self.thread.start()
+
+    def _run(self):
+        previous_command = previous_state = previous_lidar = None
+        next_actuator = 0
+        was_enabled = False
+        try:
+            self.backend.connect()
+            self.connected.set()
+            while not self.done.is_set():
+                now = time.monotonic()
+                with self.lock:
+                    sample = self.sample
+                command = self.rules.update(sample, now)
+                if self.recorder:
+                    if command != previous_command:
+                        self.recorder.emit("command", asdict(command), now)
+                    if self.rules.state != previous_state:
+                        self.recorder.emit("state", self.rules.state, now)
+                previous_command, previous_state = command, self.rules.state
+                if now >= next_actuator or (was_enabled and not self.rules.enabled):
+                    if self.rules.enabled:
+                        # K10 checks this again between its two acknowledged servo writes.
+                        self.backend.apply(command, valid_until=sample.timestamp + self.config.gamepad.stale_seconds)
+                    else:
+                        self.backend.stop()
+                    observation = self.backend.observe()
+                    if self.recorder:
+                        self.recorder.emit("observation", {"pose": observation.pose,
+                            "opponent": observation.opponent, "collision": observation.collision,
+                            "sensors": [asdict(reading) for reading in observation.sensors]})
+                        if observation.lidar is not None and observation.lidar is not previous_lidar:
+                            self.recorder.emit("lidar", asdict(observation.lidar))
+                            previous_lidar = observation.lidar
+                    with self.lock:
+                        self.observation = observation
+                    next_actuator = max(now + getattr(self.backend, "period", 0.05), time.monotonic())
+                was_enabled = self.rules.enabled
+                with self.lock:
+                    self.command, self.state = command, self.rules.state
+                self.wake.wait(min(0.02, max(0, next_actuator-time.monotonic())))
+                self.wake.clear()
+        except BaseException as error:
+            self.error = error
+            with self.lock:
+                self.command = self.rules.disable("Session failed: start a new session")
+                self.state = self.rules.state
+            if self.recorder:
+                try:
+                    self.recorder.emit("command", asdict(self.command))
+                    self.recorder.emit("state", self.state)
+                except RuntimeError:
+                    pass
+        finally:
+            try:
+                self.backend.close()
+            except BaseException as error:
+                self.error = self.error or error
+            with self.lock:
+                self.command = self.rules.disable("Session closed")
+                self.state = self.rules.state
+            if self.recorder:
+                try:
+                    self.recorder.emit("command", asdict(self.command))
+                    self.recorder.emit("state", self.state)
+                except RuntimeError as error:
+                    self.error = self.error or error
+
+    def close(self):
+        self.done.set()
+        self.wake.set()
+        self.thread.join(timeout=3)
+        if self.thread.is_alive():
+            raise RuntimeError("Actuator cleanup did not finish within 3 seconds")

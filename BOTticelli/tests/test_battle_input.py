@@ -7,7 +7,7 @@ import pygame as pg
 import pytest
 
 from botticelli.battle_config import generate
-from botticelli.battle_input import BattleInput
+from botticelli.battle_runtime import BattleInput
 from botticelli.battle_runtime import BattleSession
 from botticelli.control import Input
 

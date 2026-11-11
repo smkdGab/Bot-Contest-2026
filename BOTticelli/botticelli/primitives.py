@@ -1,17 +1,74 @@
 """Small K10 operations. Units and payloads follow binary-protocol.md."""
 import io
+import getpass
 import json
 import math
 import re
 import secrets
+import signal
 import struct
+import sys
+import threading
 import time
+import warnings
 import wave
+from contextlib import contextmanager
 from urllib.request import Request, urlopen
 
-from .sensors import decode_frame
-from .safety import finish_cleanup
-from .transport import K10Transport
+from .protocol import K10Transport, decode_reply
+
+
+def private_token():
+    if not sys.stdin.isatty():
+        raise ValueError('Hardware sessions require a terminal for private TFT token entry')
+    with warnings.catch_warnings():
+        warnings.simplefilter('error', getpass.GetPassWarning)
+        try:
+            token = getpass.getpass('Five-character TFT token (hidden): ')
+        except getpass.GetPassWarning as error:
+            raise ValueError('Private token entry unavailable') from error
+    if len(token) != 5 or any(not 33 <= ord(c) <= 126 for c in token):
+        raise ValueError('Use five printable ASCII characters shown on the TFT')
+    return token
+
+
+@contextmanager
+def termination_cleanup():
+    """Unwind finally blocks on SIGTERM/Ctrl+C; repeated signals allow cleanup."""
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+    signals = (signal.SIGINT, signal.SIGTERM)
+    previous = {s: signal.getsignal(s) for s in signals}
+    def interrupt(signum, frame):
+        for s in signals:
+            signal.signal(s, signal.SIG_IGN)
+        if signum == signal.SIGINT:
+            raise KeyboardInterrupt
+        raise SystemExit(128 + signum)
+    try:
+        for s in signals:
+            signal.signal(s, interrupt)
+        yield
+    finally:
+        for s, handler in previous.items():
+            signal.signal(s, handler)
+
+
+@contextmanager
+def finish_cleanup():
+    """Do not interrupt an already-running, bounded network cleanup."""
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+    previous = {s: signal.getsignal(s) for s in (signal.SIGINT, signal.SIGTERM)}
+    try:
+        for s in previous:
+            signal.signal(s, signal.SIG_IGN)
+        yield
+    finally:
+        for s, handler in previous.items():
+            signal.signal(s, handler)
 
 
 STREAMS = {'lidar':(0x83,'lidar',8), 'intensity':(0x89,'lidar_intensity',8),
@@ -25,43 +82,6 @@ def filename(text):
     if not re.fullmatch(r'[A-Za-z0-9_-][A-Za-z0-9_.-]*\.wav',text) or '..' in text or len(text)>48:
         raise ValueError('Use a simple ASCII filename ending in lowercase .wav, at most 48 bytes, without paths or ..')
     return text
-
-
-def decode(kind, body):
-    if kind=='raw': return body
-    if kind=='ack': return {'ok':True}
-    if kind=='ping': return {'pong':True}
-    if kind=='name': return {'name':body[2:].decode('utf8')}
-    if kind=='battery':
-        if body[2]>100: raise ValueError('Invalid battery percentage')
-        return {'battery_percent':body[2]}
-    if kind in ('servo','motor','led'):
-        m=body[2]; count=6 if kind=='servo' else 4 if kind=='motor' else 5
-        if not m or m>=1<<count: raise ValueError('Invalid echoed channel mask')
-        size=2 if kind=='servo' else 1 if kind=='motor' else 4
-        if len(body)!=3+m.bit_count()*size: raise ValueError('Invalid channel readback length')
-        values={}; offset=3
-        for ch in range(count):
-            if not m & (1<<ch): continue
-            if kind=='servo': value=struct.unpack_from('>h',body,offset)[0]
-            elif kind=='motor': value=struct.unpack_from('b',body,offset)[0]
-            else: value=dict(zip(('red','green','blue','brightness'),body[offset:offset+4]))
-            values[f'{"S" if kind=="servo" else "M" if kind=="motor" else "L"}{ch+(kind=="motor")}']=value
-            offset+=size
-        return {'commanded_degrees' if kind=='servo' else 'commanded_percent' if kind=='motor' else 'leds':values}
-    if kind=='board-led': return {'board_leds':json.loads(body[2:].decode('utf8'))}
-    if kind=='accel': return {'accel_mg':list(struct.unpack_from('<hhh',body,2))}
-    if kind=='imu-config':
-        a,b,c,d=struct.unpack_from('<BHBB',body,2)
-        return dict(range_code=a,rate_hz=b,power_code=c,hpf_code=d)
-    if kind=='bump-config':
-        a,b=struct.unpack_from('<HH',body,2); return dict(threshold_mg=a,debounce_ms=b)
-    if kind=='algorithm': return dict(algorithm_code=body[2],learned_id_count=struct.unpack_from('<H',body,3)[0])
-    if kind=='controls': return dict(zip(('illumination','illumination_supported','rgb','rgb_supported','display','display_supported','sensor_command'),body[2:]))
-    if kind=='lidar':
-        frame=decode_frame(b'\x8f'+body[1:],time.monotonic())
-        return dict(frame_id=frame.frame_id,timestamp_ms=frame.timestamp_ms,distance_mm=frame.values_mm)
-    raise ValueError('Unknown response decoder')
 
 
 def stream_frame(name,hz,fmt,enabled=True):
@@ -173,7 +193,7 @@ class Robot:
         try:
             if decoder in ('servo', 'motor', 'led') and body[2] != frame[1]:
                 raise ValueError('Reply channel mask does not match requested channels')
-            return decode(decoder, body)
+            return decode_reply(decoder, body)
         except (ValueError, struct.error, UnicodeError) as error:
             self.transport.fault.set()
             raise ValueError(f'Malformed component reply: {error}') from error

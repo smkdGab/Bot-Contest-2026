@@ -16,6 +16,13 @@ def robot(bot, **kwargs):
     return Robot('127.0.0.1', 'test!', port=bot.address[1], **kwargs)
 
 
+def test_primitives_import_without_site_packages():
+    result = subprocess.run([sys.executable, '-S', '-c',
+        'from botticelli.primitives import Robot, private_token, termination_cleanup'],
+        capture_output=True, text=True, timeout=5)
+    assert result.returncode == 0, result.stderr
+
+
 @pytest.mark.parametrize('failure', [None, ValueError, KeyboardInterrupt, SystemExit])
 def test_context_homes_only_selected_channels_after_stopping(bot, failure):
     client = robot(bot)
@@ -184,8 +191,7 @@ def test_watchdog_stops_and_homes_when_control_progress_stalls(bot):
 def test_process_signal_runs_real_session_cleanup(bot, signum):
     script = '''
 import os, signal
-from botticelli.primitives import Robot
-from botticelli.safety import termination_cleanup
+from botticelli.primitives import Robot, termination_cleanup
 class CheckedRobot(Robot):
     def close(self):
         # A second signal during shutdown must not interrupt the remaining steps.

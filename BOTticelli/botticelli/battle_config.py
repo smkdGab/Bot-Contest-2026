@@ -10,7 +10,7 @@ import yaml
 from shapely.geometry import LineString, Point, Polygon
 
 from .config import Car, Config, Gamepad, Lidar
-from .battle_geometry import Geometry, balloon, body, segment_blocked, tooth, transform
+from .battle import Geometry, balloon, body, segment_blocked, tooth, transform
 
 DEFAULTS = {
     'opponents': {'min': 1, 'max': 5}, 'generation_attempts': 2000,

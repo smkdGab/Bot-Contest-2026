@@ -5,7 +5,8 @@ import numpy as np
 import pytest
 
 from botticelli.config import Box, Lidar
-from botticelli.lidar import RayCaster, decode_frame
+from botticelli.simulation import RayCaster
+from botticelli.protocol import decode_frame
 from test_k10 import lidar_packet
 
 
