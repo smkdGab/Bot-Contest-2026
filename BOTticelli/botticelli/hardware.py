@@ -13,10 +13,9 @@ import time
 
 from .primitives import Robot, STREAMS, ALGORITHMS, SCREENS, servo_limits, filename, wav_bytes
 from .primitives import private_token, termination_cleanup
+from .protocol import STATUS
 
 
-STATUS = {1:'invalid parameters', 2:'invalid values', 3:'operation failed / device unsupported',
-          4:'service not started', 5:'unknown service', 6:'unknown command', 7:'not master'}
 SENSOR_NAMES = {
     'lidar': 'DFRobot SEN0682 64x8 DTOF LiDAR',
     'imu': 'DFRobot SEN0409 LIS2DW12 accelerometer',
@@ -26,8 +25,8 @@ SENSOR_NAMES = {
 SENSOR_NAMES['intensity'] = SENSOR_NAMES['lidar']
 SENSOR_NAMES['bump'] = SENSOR_NAMES['imu']
 CAPABILITIES = {
-    'servo': 'DFRobot DFR1216: S0..S5 positional angle or continuous speed',
-    'motor': 'DFRobot DFR1216: M1..M4 speed and stop',
+    'servo': 'DFRobot DFR1216: S0..S5; separate positional and continuous commands',
+    'dc-motor': 'DFRobot DFR1216: M1..M4 DC motors, speed and stop',
     'battery': 'DFRobot DFR1216: charge level, 0..100 percent',
     'lidar': SENSOR_NAMES['lidar'] + ': distance, intensity and streaming',
     'compass': SENSOR_NAMES['compass'] + ': heading, magnetic field and streaming',
@@ -39,11 +38,36 @@ CAPABILITIES = {
 }
 
 
+class Parser(argparse.ArgumentParser):
+    """Standard argparse, with required labels and an example on errors."""
+    def __init__(self, *args, **kwargs):
+        kwargs.setdefault('formatter_class', argparse.ArgumentDefaultsHelpFormatter)
+        super().__init__(*args, **kwargs)
+
+    def add_argument(self, *args, **kwargs):
+        action = super().add_argument(*args, **kwargs)
+        if action.required:
+            action.help = (action.help or action.dest) + ' (required)'
+        return action
+
+    def add_subparsers(self, **kwargs):
+        kwargs.setdefault('title', 'commands (required)')
+        kwargs.setdefault('help', 'choose a command (required)')
+        return super().add_subparsers(**kwargs)
+
+    def error(self, message):
+        self.print_usage(sys.stderr)
+        self.exit(2, f'{self.prog}: {message}\n{self.epilog or ""}\nHelp: {self.prog} --help\n')
+
+
 def command(commands, name, summary, example, *, device=None):
     parser = commands.add_parser(name, help=summary,
         description=f'{device}: {summary}' if device else summary,
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
         epilog='Example: ' + example)
+    if parser.prog.startswith('python -m botticelli hardware') and not example.startswith('python '):
+        example = 'python -m botticelli hardware --host YOUR_BOT_IP ' + example
+    parser.epilog = 'Example: ' + example
+    parser.set_defaults(example=example)
     if device:
         parser.set_defaults(device_name=device)
     return parser
@@ -56,14 +80,14 @@ def output(value):
 
 def requested(args):
     hidden = {'run', 'upload', 'command', 'component', 'action', 'host', 'port', 'http_port',
-              'timeout', 'geomag_rate_format', 'dry_run', 'full', 'sensor', 'device_name', 'view', 'board'}
+              'timeout', 'geomag_rate_format', 'dry_run', 'full', 'sensor', 'device_name', 'view', 'board', 'family', 'example'}
     values = {k:v for k,v in vars(args).items() if k not in hidden and v is not None}
-    prefix = {'servo':'S', 'motor':'M', 'led':'L'}.get(args.component)
+    prefix = {'servo':'S', 'dc-motor':'M', 'led':'L'}.get(args.component)
     if prefix:
         for key in ('channel', 'channels'):
             if key in values:
                 selected = values[key] if key == 'channels' else [values[key]]
-                labels = [prefix+str(c+(args.component=='motor')) for c in selected]
+                labels = [prefix+str(c+(args.component=='dc-motor')) for c in selected]
                 values[key] = labels if key == 'channels' else labels[0]
     if 'continuous' in values:
         values['continuous'] = ['S'+str(c) for c in values['continuous']]
@@ -80,9 +104,9 @@ def integer_between(low, high):
         try:
             value = int(text)
         except ValueError as error:
-            raise argparse.ArgumentTypeError('Expected an integer') from error
+            raise argparse.ArgumentTypeError(f'got {text!r}; expected an integer from {low} to {high}') from error
         if not low <= value <= high:
-            raise argparse.ArgumentTypeError(f'Expected {low}..{high}')
+            raise argparse.ArgumentTypeError(f'got {text!r}; allowed range is {low}..{high}')
         return value
     return parse
 
@@ -91,7 +115,7 @@ def channel(prefix, count, first=0):
     def parse(text):
         match = re.fullmatch(f'{prefix}([0-9]+)', text.upper())
         if not match or not first <= int(match[1]) < first+count:
-            raise argparse.ArgumentTypeError(f'Use {prefix}{first}..{prefix}{first+count-1}')
+            raise argparse.ArgumentTypeError(f'got {text!r}; use {prefix}{first}..{prefix}{first+count-1}')
         return int(match[1])-first
     return parse
 
@@ -100,9 +124,9 @@ def finite_seconds(text):
     try:
         value = float(text)
     except ValueError as error:
-        raise argparse.ArgumentTypeError('Expected seconds') from error
+        raise argparse.ArgumentTypeError(f'got {text!r}; expected a duration in seconds') from error
     if not math.isfinite(value) or not 0 < value <= 60:
-        raise argparse.ArgumentTypeError('Seconds must be in (0, 60]')
+        raise argparse.ArgumentTypeError(f'got {text!r}; duration must be greater than 0 and at most 60 seconds')
     return value
 
 
@@ -156,34 +180,40 @@ def add_components(parser, *, shell=True):
     stop = command(groups, 'stop', 'Stop DC motors and explicitly selected continuous servos; best-effort network stop.',
                    'stop --continuous S0 S4', device='DFRobot DFR1216')
     stop.add_argument('--continuous', nargs='+', type=channel('S',6), default=[], help='known continuous channels S0..S5 to zero individually')
-    for name in ('servo','motor'):
-        root = command(groups, name, 'Control DFR1216 servos S0..S5.' if name == 'servo' else 'Control DFR1216 DC motors M1..M4.', name+' read '+('S0' if name == 'servo' else 'M1'), device='DFRobot DFR1216')
+    servo = command(groups, 'servo', 'Select positional servos (degrees) or continuous servos (speed).',
+                    'servo positional angle S0 45', device='DFRobot DFR1216, S0..S5')
+    families = servo.add_subparsers(dest='family', required=True)
+    for family, parent, path, summary in (
+            ('positional', families, 'servo positional', 'Position in degrees; defaults: type 270, home 0.'),
+            ('continuous', families, 'servo continuous', 'Rotation speed in percent; zero stops rotation.'),
+            ('dc-motor', groups, 'dc-motor', 'DC motors on M1..M4, separate from the servo outputs S0..S5.')):
+        dc = family == 'dc-motor'
+        positional = family == 'positional'
+        example_channel = 'M1' if dc else 'S0' if positional else 'S5'
+        root = command(parent, family, summary, path+(' angle ' if positional else ' speed ')+example_channel+' '+('45' if positional else '15'), device='DFRobot DFR1216')
         actions = root.add_subparsers(dest='action', required=True)
-        example_channel = 'S0' if name == 'servo' else 'M1'
-        read = command(actions, 'read', 'Read commanded values; this is not physical encoder feedback.', name+' read '+example_channel, device='DFRobot DFR1216')
-        read.add_argument('channels', nargs='+', type=channel('S',6) if name=='servo' else channel('M',4,1), help='servo S0..S5' if name == 'servo' else 'motor M1..M4')
-        speed = command(actions, 'speed', 'Run a timed speed test, then stop. Servo channels are configured as continuous.', name+' speed '+example_channel+' 15 --seconds 1', device='DFRobot DFR1216')
-        speed.add_argument('channel', type=channel('S',6) if name=='servo' else channel('M',4,1), help='servo S0..S5' if name == 'servo' else 'motor M1..M4')
-        speed.add_argument('value', type=integer_between(-100,100), help='signed speed percent')
-        speed.add_argument('--seconds', type=finite_seconds, default=1., help='default 1; maximum 60')
-        if name=='servo':
-            for name2 in ('angle','increment','type'):
-                summary, example = {
-                    'angle': ('Set an absolute angle in degrees; return to --home at session exit.', 'servo angle S0 45 --type 180 --home 90'),
-                    'increment': ('Add degrees to the reported commanded angle; reject targets outside safe limits.', 'servo increment S0 10 --type 180 --home 90'),
-                    'type': ('Configure a servo type. Positional types require --home; continuous servos stop with speed zero.', 'servo type S0 180 --home 90'),
-                }[name2]
-                action = command(actions, name2, summary, example, device='DFRobot DFR1216')
-                action.add_argument('channel', type=channel('S',6), help='servo channel S0..S5')
-                if name2=='type':
-                    action.add_argument('value', choices=('180','270','continuous'))
-                else:
-                    action.add_argument('value', type=integer_between(-270,270), help='degrees: absolute angle or signed increment')
-                    action.add_argument('--type', dest='servo_type', type=int, choices=(180,270), required=True, help='actual positional servo range in degrees')
-                    action.add_argument('--seconds', type=finite_seconds, default=1., help='maintain session for movement; default 1 second')
-                action.add_argument('--home', type=integer_between(0,270), help='required safe home for positional servos')
-                action.add_argument('--min-angle', type=integer_between(0,270), default=0, help='safe lower endpoint in degrees')
-                action.add_argument('--max-angle', type=integer_between(0,270), help='safe upper endpoint in degrees; otherwise servo type maximum')
+        verbs = ('angle','increment','configure','read') if positional else ('speed','read') if dc else ('speed','configure')
+        for verb in verbs:
+            description = {'angle':'Set angle in degrees; return home at session exit.',
+                'increment':'Add degrees to the reported angle, within safe limits.',
+                'configure':'Configure only this servo channel.',
+                'read':'Read commanded values; no physical encoder feedback.',
+                'speed':'Set signed speed percent (-100..100), then stop after --seconds.'}[verb]
+            example = path+' '+verb+' '+example_channel+(' 45' if verb=='angle' else ' 10' if verb in ('increment','speed') else '')
+            p = command(actions, verb, description, example, device='DFRobot DFR1216')
+            p.add_argument('channels' if verb=='read' else 'channel', nargs='+' if verb=='read' else None,
+                type=channel('M',4,1) if dc else channel('S',6), metavar='CHANNEL',
+                help='DC motor output M1..M4' if dc else 'positional servo S0..S5' if positional else 'continuous servo S0..S5')
+            if verb in ('angle','increment','speed'):
+                p.add_argument('value', type=integer_between(0 if verb=='angle' else -270 if positional else -100, 270 if positional else 100),
+                    metavar='ANGLE' if verb=='angle' else 'DELTA' if verb=='increment' else 'PERCENT',
+                    help='angle in degrees' if verb=='angle' else 'signed change in degrees' if verb=='increment' else 'signed speed percent; 0 stops')
+                p.add_argument('--seconds', type=finite_seconds, default=1., help='session duration in seconds, at most 60')
+            if positional and verb != 'read':
+                p.add_argument('--type', dest='servo_type', type=int, choices=(180,270), default=270, help='positional servo range in degrees')
+                p.add_argument('--home', type=integer_between(0,270), default=0, help='home angle on exit, in degrees')
+                p.add_argument('--min-angle', type=integer_between(0,270), default=0, help='safe lower endpoint in degrees')
+                p.add_argument('--max-angle', type=integer_between(0,270), help='safe upper endpoint; default: servo type range')
     led = command(groups, 'led', 'Control K10 NeoPixels and DFR1216 WS2812 LEDs.', 'led read L0 L3', device='UniHiker K10 / DFRobot DFR1216')
     led.set_defaults(board=False)
     led_actions = led.add_subparsers(dest='action', required=True)
@@ -239,7 +269,7 @@ def add_components(parser, *, shell=True):
 
 def add_parser(commands):
     parser = command(commands, 'hardware', 'Test K10 components. Live sessions register once; help and dry-run are offline. Put connection options before the component command.', 'python -m botticelli hardware --host YOUR_BOT_IP shell', device='UniHiker K10 / DFRobot DFR1216')
-    parser.add_argument('--host',help='bot IP or hostname; no default live destination')
+    parser.add_argument('--host',help='bot IP or hostname (required for live commands)')
     parser.add_argument('--port', type=integer_between(1,65535),default=24642, help='K10 UDP port')
     parser.add_argument('--http-port', type=integer_between(1,65535),default=80, help='HTTP port for sound operations')
     parser.add_argument('--timeout', type=float,default=.25,help='UDP reply timeout seconds (0.05..2)')
@@ -253,19 +283,21 @@ def add_parser(commands):
 def validate(args):
     """Validate a command before registration or any actuator configuration."""
     c, a = args.component, getattr(args, 'action', None)
-    if c == 'servo' and a in ('angle', 'increment', 'type'):
-        kind = args.value if a == 'type' else str(args.servo_type)
-        kind = 'continuous' if kind == 'continuous' else int(kind)
-        limits = servo_limits(kind, args.home, args.min_angle, args.max_angle)
+    if c == 'servo' and args.family == 'positional' and a != 'read':
+        try:
+            limits = servo_limits(args.servo_type, args.home, args.min_angle, args.max_angle)
+        except ValueError as error:
+            raise ValueError(f'S{args.channel}: {error}; --type {args.servo_type}, --home {args.home}, --min-angle {args.min_angle}, --max-angle {args.max_angle if args.max_angle is not None else args.servo_type}') from error
         if a == 'angle' and not limits[1] <= args.value <= limits[2]:
-            raise ValueError('Requested angle exceeds the configured safe range')
+            raise ValueError(f'S{args.channel}: angle {args.value} degrees is outside the safe range {limits[1]}..{limits[2]} degrees')
     if c == 'sensor' and a in ('read', 'watch'):
         cell = getattr(args, 'cell', None)
         if cell is not None and not (0 <= cell[0] < 8 and 0 <= cell[1] < 64):
-            raise ValueError('Cell must be row 0..7 and column 0..63')
+            raise ValueError(f'Cell {cell[0]}, {cell[1]} is invalid; use --cell ROW COL with row 0..7 and column 0..63')
         names = list(STREAMS) if args.sensor == 'all' else [args.sensor]
-        if any(args.hz > STREAMS[n][2] for n in names):
-            raise ValueError('Rate exceeds selected sensor limit')
+        for name in names:
+            if args.hz > STREAMS[name][2]:
+                raise ValueError(f'{SENSOR_NAMES[name]}: --hz {args.hz} exceeds the limit; use --hz 1..{STREAMS[name][2]}')
     if c == 'sound':
         if a in ('play', 'upload', 'delete'):
             filename(args.filename)
@@ -299,7 +331,7 @@ class Bench(Robot):
     def execute(self, args):
         validate(args)
         c, a = args.component, getattr(args, 'action', None)
-        label = ' '.join(filter(None, (c, getattr(args, 'device', ''), getattr(args, 'view', ''),
+        label = ' '.join(filter(None, (c, getattr(args, 'family', ''), getattr(args, 'device', ''), getattr(args, 'view', ''),
             'board' if getattr(args, 'board', False) else '', a)))
         device = getattr(args, 'device_name', 'UniHiker K10')
         if args.component == 'capabilities':
@@ -310,7 +342,7 @@ class Bench(Robot):
                 cleanup='stop propulsion; home selected positional servos; disable streams; unregister'))
             return
         self.connect()
-        duration = getattr(args, 'seconds', 0) if c in ('servo', 'motor') else 0
+        duration = getattr(args, 'seconds', 0) if c in ('servo', 'dc-motor') else 0
         result = None
         try:
             if c in ('ping', 'name', 'battery'):
@@ -318,14 +350,13 @@ class Bench(Robot):
             elif c == 'stop':
                 self.continuous.update(args.continuous)
                 self.stop()
-            elif c in ('servo', 'motor'):
+            elif c in ('servo', 'dc-motor'):
                 if a == 'read':
-                    result = getattr(self, c+'_read')(*[ch+(c=='motor') for ch in args.channels])
-                elif c == 'motor':
+                    result = (self.motor_read if c == 'dc-motor' else self.servo_read)(*[ch+(c=='dc-motor') for ch in args.channels])
+                elif c == 'dc-motor':
                     result = self.motor_speed(args.channel+1, args.value, ttl=min(60, duration+.1))
                 else:
-                    kind = args.value if a == 'type' else 'continuous' if a == 'speed' else str(args.servo_type)
-                    kind = 'continuous' if kind == 'continuous' else int(kind)
+                    kind = args.servo_type if args.family == 'positional' else 'continuous'
                     self.configure_servo(args.channel, kind, home=getattr(args, 'home', None),
                         minimum=getattr(args, 'min_angle', 0), maximum=getattr(args, 'max_angle', None))
                     if a in ('angle', 'increment', 'speed'):
@@ -435,10 +466,10 @@ class Bench(Robot):
 
 def run(args):
     if not math.isfinite(args.timeout) or not .05 <= args.timeout <= 2:
-        raise ValueError('--timeout must be in 0.05..2 seconds')
+        raise ValueError(f'--timeout {args.timeout} is invalid; use 0.05..2 seconds')
     offline = args.dry_run or args.component == 'capabilities'
     if not offline and not args.host:
-        raise ValueError('Set --host to the bot IP or hostname')
+        raise ValueError('Missing --host: use hardware --host YOUR_BOT_IP before the component command')
     if args.component != 'shell':
         validate(args)
     elif not sys.stdin.isatty():
@@ -447,9 +478,9 @@ def run(args):
     with termination_cleanup():
         try:
             if args.component == 'shell':
-                if not offline: bench.connect()  # register before the first prompt
-                parser = argparse.ArgumentParser(prog='k10', exit_on_error=False)
+                parser = Parser(prog='k10', epilog='Example: servo positional angle S0 45')
                 add_components(parser, shell=False)
+                if not offline: bench.connect()  # register before the first prompt
                 print('K10 bench. Type help for commands, exit to stop and return selected servos home.')
                 while True:
                     try: line = input('k10> ').strip()
@@ -457,15 +488,23 @@ def run(args):
                     if line in ('exit', 'quit'): break
                     if not line: continue
                     if line in ('help', '?'): parser.print_help(); continue
+                    parsed = None
                     try:
                         words = shlex.split(line)
                         if words and words[0] == 'help':
                             words = words[1:] + ['--help']
-                        command = validate(parser.parse_args(words))
+                        parsed = parser.parse_args(words)
+                        validate(parsed)
                     except (SystemExit, argparse.ArgumentError, ValueError, OSError) as error:
-                        if not isinstance(error, SystemExit): print(f'Invalid command: {error}', file=sys.stderr)
+                        if not isinstance(error, SystemExit):
+                            print(f'Invalid command: {error}\nExample: {parsed.example if parsed else "help"}', file=sys.stderr)
                         continue
-                    bench.execute(command)
+                    try:
+                        bench.execute(parsed)
+                    except ValueError as error:
+                        if bench.transport is not None and bench.transport.fault.is_set():
+                            raise
+                        print(f'Invalid command: {error}\nExample: {parsed.example}', file=sys.stderr)
             else:
                 bench.execute(args)
         finally:

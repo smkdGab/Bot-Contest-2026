@@ -7,7 +7,7 @@ import sys
 import time
 
 from .primitives import private_token, termination_cleanup, finish_cleanup
-from .hardware import command
+from .hardware import Parser, command
 
 
 @termination_cleanup()
@@ -177,10 +177,9 @@ def run_battle(args):
 
 
 def build_parser():
-    parser = argparse.ArgumentParser(prog='python -m botticelli',
+    parser = Parser(prog='python -m botticelli',
         description='K10 hardware control and offline driving practice.',
-        epilog='Help: COMMAND -h or COMMAND SUBCOMMAND --help. See CLI.md.',
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+        epilog='Example: python -m botticelli hardware --host YOUR_BOT_IP shell\nHelp: COMMAND --help. See CLI.md.')
     commands = parser.add_subparsers(dest="command", required=True)
     from .hardware import add_parser
     add_parser(commands)
@@ -191,7 +190,7 @@ def build_parser():
     check.set_defaults(run=gamepad_check)
     control = command(commands, 'drive', 'Drive with a gamepad: hold A to enable, release A to stop. Real mode prompts for the TFT token.',
                       'python -m botticelli drive --backend sim')
-    control.add_argument("--backend", choices=("sim", "real"), required=True, help='simulation or K10 hardware')
+    control.add_argument("--backend", choices=("sim", "real"), default='sim', help='simulation or K10 hardware')
     control.add_argument("--config", default=default_config, help='vehicle and hardware configuration YAML')
     control.add_argument("--record", metavar="SESSION.jsonl", help='create a new recording; existing files are not overwritten')
     control.add_argument("--headless", action="store_true", help='offline simulation without a window; requires --seconds')
@@ -224,7 +223,8 @@ def main():
     except KeyboardInterrupt:
         print("Interrupted; cleanup attempted (see any errors above).", file=sys.stderr)
     except (OSError, RuntimeError, ValueError, TypeError) as error:
-        parser.exit(1, f"BOTticelli: {error}\n")
+        example = getattr(args, 'example', 'python -m botticelli --help')
+        parser.exit(1, f'BOTticelli: {error}\nExample: {example}\n')
 
 
 if __name__ == "__main__":

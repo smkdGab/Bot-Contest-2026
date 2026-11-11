@@ -475,20 +475,30 @@ class Robot:
         raise TimeoutError('Sound stop not confirmed within ten seconds')
 
     def _cleanup(self, frame):
+        action = frame[0]
+        step = {0x23:'zero continuous servo', 0x28:'stop DC motors', 0x24:'home positional servo',
+                0x42:'unregister', 0x83:'disable LiDAR distance stream', 0x89:'disable LiDAR intensity stream',
+                0xA2:'disable IMU stream', 0x93:'disable compass stream', 0x72:'disable HuskyLens stream'}[action]
+        if action in (0x23, 0x24):
+            step += ' ' + ','.join(f'S{ch}' for ch in range(6) if frame[1] & (1 << ch))
+        if action == 0x24:
+            step += f' to {struct.unpack_from(">h", frame, 2)[0]} degrees'
+        prefix = f'{step} (0x{action:02x}): '
         try:
             self.transport.request(frame, cleanup=True)
         except Exception as error:
-            self.cleanup_errors.append(f'0x{frame[0]:02x}: {error}')
+            self.cleanup_errors[:] = [e for e in self.cleanup_errors if not e.startswith(prefix)] + [prefix + str(error)]
+            return False
+        self.cleanup_errors[:] = [e for e in self.cleanup_errors if not e.startswith(prefix)]
+        return True
 
     def stop(self):
         if self.transport is None or not self.registered:
             return
-        before = len(self.cleanup_errors)
-        for ch in sorted(self.continuous):
-            self._cleanup(bytes([0x23, 1 << ch, 0]))
-        self._cleanup(b'\x28')
-        if len(self.cleanup_errors) != before:
-            raise RuntimeError('Stop not confirmed')
+        confirmed = [self._cleanup(bytes([0x23, 1 << ch, 0])) for ch in sorted(self.continuous)]
+        confirmed.append(self._cleanup(b'\x28'))
+        if not all(confirmed):
+            raise RuntimeError('Stop not confirmed: ' + '; '.join(self.cleanup_errors))
         self.transport.motion_deadline = float('inf')
 
     @finish_cleanup()
