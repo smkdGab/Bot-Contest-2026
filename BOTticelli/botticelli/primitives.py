@@ -139,7 +139,7 @@ class Robot:
     Motion has a bounded lease (default 0.5 s). Repeat motion calls to renew it.
     Cleanup is best-effort; ACKs are not physical position feedback.
     """
-    def __init__(self, host, token, *, port=24642, timeout=1.0, http_port=80, geomag_rate_format='u16be'):
+    def __init__(self, host, token, *, port=24642, timeout=1.0, http_port=80, geomag_rate_format='u16be', debug=False):
         if not host or not re.fullmatch(r'[A-Za-z0-9.-]+', host):
             raise ValueError('Set host to the K10 IP or hostname')
         integer(port, 1, 65535); integer(http_port, 1, 65535)
@@ -149,6 +149,7 @@ class Robot:
             raise ValueError('Unknown compass rate format')
         self.host, self.port, self.timeout = host, port, timeout
         self.http_port, self.geomag_rate_format = http_port, geomag_rate_format
+        self.debug = debug
         self._token = token
         self.transport = None
         self.attempted = self.registered = False
@@ -174,11 +175,13 @@ class Robot:
         token, self._token = self._token, ''
         if not isinstance(token, str) or len(token) != 5 or any(not 33 <= ord(c) <= 126 for c in token):
             raise ValueError('Use five printable ASCII characters from the TFT')
-        self.transport = K10Transport(self.host, self.port, self.timeout)
+        self.transport = K10Transport(self.host, self.port, self.timeout, debug=self.debug)
         try:
             self.attempted = True
+            self.transport.log('SESSION', 'register master')
             self.transport.request(b'\x41' + token.encode('ascii'))
             self.registered = True
+            self.transport.log('SESSION', 'registration confirmed')
             self.transport.start_heartbeat()
         except BaseException:
             self.close()
@@ -193,8 +196,12 @@ class Robot:
         try:
             if decoder in ('servo', 'motor', 'led') and body[2] != frame[1]:
                 raise ValueError('Reply channel mask does not match requested channels')
-            return decode_reply(decoder, body)
+            result = decode_reply(decoder, body)
+            if self.debug and isinstance(result, dict):
+                self.transport.log('DATA', ' '.join(f'{key}={value!r}' for key, value in result.items()))
+            return result
         except (ValueError, struct.error, UnicodeError) as error:
+            self.transport.log('DECODE', f'{decoder}: {error}')
             self.transport.fault.set()
             raise ValueError(f'Malformed component reply: {error}') from error
 
@@ -211,9 +218,11 @@ class Robot:
 
     def _motion(self, frame, ttl):
         self._lease(ttl)
+        self.transport.log('MOTION', f'action=0x{frame[0]:02x} ACK budget={self.timeout:g}s hold lease={ttl:g}s')
         self.transport.motion_deadline += self.timeout  # bounded ACK wait, heartbeat stays independent
         result = self._request(frame)
         self._lease(ttl)  # hold duration starts only after a valid, timely ACK
+        self.transport.log('MOTION', f'ACK confirmed; hold lease={ttl:g}s started')
         return result
 
     def configure_servo(self, channel, kind, *, home=None, minimum=0, maximum=None):
@@ -368,6 +377,8 @@ class Robot:
         if type(enabled) is not bool:
             raise ValueError('Use a boolean for stream enable')
         frame = stream_frame(name, hz, self.geomag_rate_format, enabled)
+        if self.transport is not None:
+            self.transport.log('STREAM', f'{name} enabled={enabled} hz={hz}')
         if enabled:
             self.streams[frame[0]] = frame  # include uncertain enables in cleanup
         reply = self._request(frame, decoder='raw', allow_status=allow_status)
@@ -434,8 +445,15 @@ class Robot:
         if not self.registered or self.transport.fault.is_set():
             raise RuntimeError('Open a healthy registered Robot session first')
         url = f'http://{self.host}:{self.http_port}{path}'
-        with urlopen(Request(url, data=data, method=method), timeout=max(2, self.timeout)) as response:
-            return response.read(1024*1024)
+        self.transport.log('HTTP-TX', f'{method} {url}', data)
+        try:
+            with urlopen(Request(url, data=data, method=method), timeout=max(2, self.timeout)) as response:
+                body = response.read(1024*1024)
+                self.transport.log('HTTP-RX', f'status={response.status} {path}', body)
+                return body
+        except Exception as error:
+            self.transport.log('HTTP-ERROR', f'{method} {path}: {error}')
+            raise
 
     def sound_status(self):
         return json.loads(self._http('/sounds'))
@@ -488,6 +506,7 @@ class Robot:
         if action == 0x24:
             step += f' to {struct.unpack_from(">h", frame, 2)[0]} degrees'
         prefix = f'{step} (0x{action:02x}): '
+        self.transport.log('CLEANUP', step)
         try:
             self.transport.request(frame, cleanup=True)
         except Exception as error:
@@ -500,6 +519,7 @@ class Robot:
         if self.transport is None or not self.registered:
             return
         self.transport.motion_deadline = float('inf')
+        self.transport.log('STOP', f'continuous={sorted(self.continuous)}; DC motors')
         confirmed = [self._cleanup(bytes([0x23, 1 << ch, 0])) for ch in sorted(self.continuous)]
         confirmed.append(self._cleanup(b'\x28'))
         if not all(confirmed):
@@ -511,6 +531,7 @@ class Robot:
             self._token = ''
             return
         self.transport.motion_deadline = float('inf')
+        self.transport.log('SESSION', 'close begin')
         try:
             if self.registered:
                 try:

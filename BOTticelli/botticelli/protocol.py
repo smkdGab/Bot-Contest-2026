@@ -1,14 +1,62 @@
 """K10 wire replies, sensor frames and the single UDP dispatcher."""
 from dataclasses import dataclass
 import json
+import queue
 import socket
 import struct
+import sys
 import threading
 import time
 
 
 STATUS = {1:'invalid parameters', 2:'invalid values', 3:'operation failed / device unsupported',
           4:'service not started', 5:'unknown service', 6:'unknown command', 7:'not master'}
+
+
+class DebugTrace:
+    """Bounded asynchronous stderr output; control threads never write to a terminal."""
+    def __init__(self, stream=None):
+        self.stream = stream if stream is not None else sys.stderr
+        self.started = time.monotonic()
+        self.lines = queue.Queue(maxsize=256)
+        self.done = threading.Event()
+        self.dropped = 0
+        self.thread = threading.Thread(target=self._write, name='k10-debug', daemon=True)
+        self.thread.start()
+
+    def __call__(self, event, detail='', packet=None):
+        if self.done.is_set():
+            return
+        wire = ''
+        if packet is not None:
+            # Register may echo a token on old firmware; Wi-Fi frames contain credentials.
+            hex_bytes = f'{packet[0]:02x} <redacted>' if packet and packet[0] in (0x41, 0x47, 0x48) else packet.hex(' ')
+            wire = f' bytes={len(packet)} hex={hex_bytes}'
+        line = f'DEBUG +{time.monotonic()-self.started:09.3f}s {event:<10} {detail}{wire}\n'
+        try:
+            self.lines.put_nowait(line)
+        except queue.Full:
+            self.dropped += 1
+
+    def _write(self):
+        while not self.done.is_set() or not self.lines.empty():
+            try:
+                line = self.lines.get(timeout=.05)
+            except queue.Empty:
+                continue
+            try:
+                if self.dropped:
+                    dropped, self.dropped = self.dropped, 0
+                    self.stream.write(f'DEBUG dropped {dropped} trace lines: output is too slow\n')
+                self.stream.write(line)
+                self.stream.flush()
+            except (OSError, ValueError):
+                self.done.set()
+                return
+
+    def close(self):
+        self.done.set()
+        self.thread.join(timeout=.5)
 
 
 @dataclass(frozen=True)
@@ -24,8 +72,10 @@ class LidarFrame:
 
 def decode_frame(body: bytes, received_at: float) -> LidarFrame:
     """Decode after diagnostics removal, with exact full-matrix length validation."""
-    if len(body) != 1034 or body[0] != 0x8F or body[1] != 0:
-        raise ValueError('Invalid LiDAR action, status, or length')
+    if len(body) != 1034:
+        raise ValueError(f'Invalid LiDAR length: {len(body)} payload bytes; expected 1034 (1042 UDP bytes including diagnostics)')
+    if body[0] != 0x8F or body[1] != 0:
+        raise ValueError(f'Invalid LiDAR action 0x{body[0]:02x} or status 0x{body[1]:02x}')
     frame_id, timestamp, count = struct.unpack_from('<HIH', body, 2)
     if count != 512:
         raise ValueError('Expected full 64 x 8 LiDAR frame')
@@ -103,7 +153,7 @@ def decode_reply(kind, body):
 
 
 class K10Transport:
-    def __init__(self, host: str, port: int = 24642, timeout: float = 1.0):
+    def __init__(self, host: str, port: int = 24642, timeout: float = 1.0, *, debug=False):
         self.address = (socket.gethostbyname(host), port)
         self.timeout = timeout
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -115,41 +165,72 @@ class K10Transport:
         self.fault_reason = ''
         self.reply_ready = threading.Event()
         self.request_lock = threading.Lock()
+        self.send_lock = threading.Lock()
         self.lock = threading.Lock()
         self.pending = None
         self.reply = None
         self.error = None
         self.received = self.other_sender = self.other_action = 0
+        self.invalid_events, self.last_event_error = 0, ''
         self.lidar = None
         self.lidar_intensity = None
         self.sensors = {}
+        self.trace = DebugTrace() if debug else None
+        self.log('OPEN', f'UDP local={self.sock.getsockname()} remote={self.address} timeout={timeout:g}s')
         self.receiver = threading.Thread(target=self._receive, name="k10-receiver", daemon=True)
         self.receiver.start()
         self.heartbeat = None
         self.motion_deadline = float('inf')
         self.emergency_frames = (b'\x28',)
 
+    def log(self, event, detail='', packet=None):
+        if self.trace is not None:
+            self.trace(event, detail, packet)
+
+    def _send(self, frame, detail):
+        with self.send_lock:
+            try:
+                self.sock.sendto(frame, self.address)
+            except OSError as error:
+                self.log('TX-ERROR', f'{detail}: {error}', frame)
+                raise
+            self.log('TX', detail, frame)
+
+    def _diagnostics(self, packet):
+        return 'rx_seq=%d server_ms=%d' % struct.unpack('>II', packet[-8:])
+
+    def _invalid_event(self, packet, error):
+        self.invalid_events += 1
+        self.last_event_error = f'action 0x{packet[0]:02x}, wire bytes={len(packet)}: {error}'
+        self.log('DROP', self.last_event_error)
+
     def _receive(self):
         while not self.done.is_set():
             try:
-                packet, sender = self.sock.recvfrom(2048)
+                packet, sender = self.sock.recvfrom(65535)
             except socket.timeout:
                 continue
-            except OSError:
+            except OSError as error:
                 if not self.done.is_set():
+                    self.fault_reason = f'UDP receive failed: {error}'
+                    self.log('RX-ERROR', self.fault_reason)
                     self.fault.set()
                     self.reply_ready.set()
                 return
+            self.log('RX', f'from={sender}', packet)
             if not packet:
+                self.log('DROP', 'empty UDP datagram')
                 continue
             if sender != self.address:
                 self.other_sender += 1
+                self.log('DROP', f'unexpected sender={sender}; expected={self.address}')
                 continue
             self.received += 1
             if packet[0] in (0x9F, 0xAF, 0xA0, 0x7F):
                 try:
                     reading = decode_sensor(packet[:-8], time.monotonic())
-                except ValueError:
+                except ValueError as error:
+                    self._invalid_event(packet, error)
                     continue
                 with self.lock:
                     previous = self.sensors.get(reading.name)
@@ -157,23 +238,34 @@ class K10Transport:
                         modulus = 2**32 if reading.name in ("imu", "bump") else 2**16
                         delta = (reading.values["frame_id"]-previous.values["frame_id"]) % modulus
                         if not 0 < delta < modulus//2:
+                            self.log('DROP', f'{reading.name} stale/duplicate frame={reading.values["frame_id"]} previous={previous.values["frame_id"]}')
                             continue
                     self.sensors[reading.name] = reading
+                if self.trace is not None:
+                    values = ' '.join(f'{key}={value!r}' for key, value in reading.values.items())
+                    self.log('READ', f'{reading.name} {self._diagnostics(packet)} {values}')
                 continue
             if packet[0] in (0x8F, 0x8E):
                 try:
                     frame = decode_frame(b"\x8f"+packet[1:-8], time.monotonic())
-                except ValueError:
+                except ValueError as error:
+                    self._invalid_event(packet, error)
                     continue
                 with self.lock:
                     name = "lidar" if packet[0] == 0x8F else "lidar_intensity"
                     previous = getattr(self, name)
                     if previous is None or 0 < ((frame.frame_id-previous.frame_id) & 0xFFFF) < 0x8000:
                         setattr(self, name, frame)
+                    else:
+                        self.log('DROP', f'{name} stale/duplicate frame={frame.frame_id} previous={previous.frame_id}')
+                        continue
+                if self.trace is not None:
+                    self.log('READ', f'{name} frame={frame.frame_id} device_ms={frame.timestamp_ms} {self._diagnostics(packet)} values={frame.values_mm}')
                 continue
             with self.lock:
                 if self.pending is None or packet[0] != self.pending[0]:
                     self.other_action += 1
+                    self.log('UNMATCHED', f'action=0x{packet[0]:02x} pending={self.pending}')
                     continue
                 action, length = self.pending
                 body = packet[:-8]
@@ -182,8 +274,12 @@ class K10Transport:
                 valid_length = (length[0] <= len(body) <= length[1]) if isinstance(length, tuple) else len(body) == length
                 if not valid_length and not short_error:
                     self.error = RuntimeError(f'Malformed reply for action 0x{action:02x}: received {len(packet)} bytes; expected {length} payload bytes plus 8 diagnostics bytes')
+                    self.log('DROP', str(self.error))
                 else:
                     self.reply = body
+                    if self.trace is not None:
+                        status = 'PING (no status byte)' if action == 0x44 else f'status=0x{body[1]:02x}'
+                        self.log('MATCH', f'action=0x{action:02x} {status} {self._diagnostics(packet)}')
                 self.pending = None
                 self.reply_ready.set()
 
@@ -197,7 +293,8 @@ class K10Transport:
                 self.reply = self.error = None
                 self.pending = (frame[0], length)
             try:
-                self.sock.sendto(frame, self.address)
+                self.log('WAIT', f'action=0x{frame[0]:02x} expected={length} timeout={self.timeout:g}s cleanup={cleanup}')
+                self._send(frame, 'cleanup' if cleanup else 'request')
                 if not self.reply_ready.wait(self.timeout):
                     raise TimeoutError(f'K10 action 0x{frame[0]:02x}: no reply within {self.timeout:g}s; command outcome uncertain. '
                         f'UDP during this request: {self.received-received} packets from bot, '
@@ -217,7 +314,8 @@ class K10Transport:
                     if frame[0] == 0x44 and self.reply != frame:
                         raise RuntimeError("PING identifier mismatch")
                     return self.reply
-            except (OSError, RuntimeError):
+            except (OSError, RuntimeError) as error:
+                self.log('FAIL', str(error))
                 self.fault.set()
                 raise
             finally:
@@ -225,6 +323,7 @@ class K10Transport:
                     self.pending = None
 
     def start_heartbeat(self):
+        self.log('HEARTBEAT', 'start interval=25ms limit=50ms; no reply expected')
         def run():
             last = time.monotonic()
             deadline = last
@@ -234,18 +333,20 @@ class K10Transport:
                     self.fault_reason = (f'Heartbeat sender gap {(now-last)*1000:.1f} ms exceeded 50 ms; stop/home attempted'
                         if now-last > 0.050 else 'Motion lease expired; stop/home attempted')
                     self.fault.set()
+                    self.log('WATCHDOG', self.fault_reason)
                     # No ACK waits here: the sole receiver remains the dispatcher.
                     # Only known stops/home targets, never the expired command.
                     for frame in self.emergency_frames:
                         try:
-                            self.sock.sendto(frame, self.address)
+                            self._send(frame, 'watchdog stop/home')
                         except OSError:
                             pass
                     return  # let the board watchdog expire as well
                 if self.fault.is_set():
+                    self.log('HEARTBEAT', 'stopped: session faulted')
                     return
                 try:
-                    self.sock.sendto(b"\x43", self.address)
+                    self._send(b'\x43', f'heartbeat gap={(now-last)*1000:.2f}ms')
                 except OSError as error:
                     self.fault_reason = f'Heartbeat send failed: {error}'
                     self.fault.set()
@@ -263,3 +364,6 @@ class K10Transport:
         self.done.set()
         self.sock.close()
         self.receiver.join()
+        self.log('CLOSE', f'UDP received={self.received} wrong_sender={self.other_sender} unmatched={self.other_action} invalid_events={self.invalid_events}')
+        if self.trace is not None:
+            self.trace.close()

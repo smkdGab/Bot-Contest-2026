@@ -23,8 +23,10 @@ its confirmation fields only after calibration. Example values are not calibrati
 
 ## Session behavior
 
-Every live session registers once and privately prompts for the TFT token,
-including reads and sound. Never store the token in commands, config or logs.
+Every live session registers once, including reads and sound. Supply the TFT token
+with `--token TOKEN`, or omit it for hidden entry. Command-line tokens may remain
+in shell history/process arguments; program output and recordings exclude them.
+Never store the token in config or logs.
 Help, capabilities and dry-run are offline.
 
 Cleanup sends speed zero individually to configured continuous servos, then
@@ -33,6 +35,10 @@ disables streams and unregisters. Servo reads do not infer a type or home.
 Ctrl+C, SIGTERM and exceptions follow this path; cleanup failures are reported.
 An unconfirmed step names the operation, channel, action code and reply error.
 An earlier stop error is cleared only after a later stop for that channel is acknowledged.
+For communication failures, use `hardware --host HOST --debug ...` as shown in
+[CLI.md](CLI.md). The trace distinguishes local heartbeat stalls, firmware errors,
+missing replies and rejected sensor frames. A confirmed command hold measures
+client time; it does not verify that the servo physically kept rotating.
 
 **Network stopping is not a physical guarantee.** Motion leases attempt stop/home
 commands when control stalls, but SIGKILL, computer power loss or lost Wi-Fi can

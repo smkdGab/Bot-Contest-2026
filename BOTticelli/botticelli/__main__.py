@@ -6,7 +6,7 @@ import sys
 import time
 
 from .primitives import private_token, termination_cleanup, finish_cleanup
-from .hardware import Parser, command
+from .hardware import Parser, command, tft_token
 
 
 @termination_cleanup()
@@ -14,6 +14,8 @@ def drive(args):
     from .config import load
     from .control import Input
     from .recording import Recorder
+    token = getattr(args, 'token', None)
+    args.token = None
     config = load(args.config)
     config.validate(real=args.backend == "real")
     if args.seconds is not None and (not math.isfinite(args.seconds) or not 0 < args.seconds <= 3600):
@@ -24,10 +26,11 @@ def drive(args):
         raise ValueError("Screenshot checks require a bounded, windowed simulation")
     if args.backend == "real":
         from .control import K10
-        backend = K10(config, private_token())
+        backend = K10(config, private_token() if token is None else token, debug=getattr(args, 'debug', False))
     else:
         from .simulation import Simulation
         backend = Simulation(config)
+    token = ''
     from .control import Driver
     recorder = Recorder(args.record, config, args.backend) if args.record else None
     dashboard = None
@@ -184,8 +187,10 @@ def build_parser():
     check = command(commands, 'gamepad-check', 'Inspect gamepad input offline; close the window to exit.')
     check.add_argument("--config", default=default_config, help='gamepad configuration YAML')
     check.set_defaults(run=gamepad_check)
-    control = command(commands, 'drive', 'Drive with a gamepad: hold A to enable, release A to stop. Real mode prompts for the TFT token.')
+    control = command(commands, 'drive', 'Drive with a gamepad: hold A to enable, release A to stop. Real mode uses the TFT token.')
     control.add_argument("--backend", choices=("sim", "real"), default='sim', help='simulation or K10 hardware')
+    control.add_argument('--token', type=tft_token, metavar='TOKEN', help='five-character TFT token for real mode; omit for a hidden prompt')
+    control.add_argument('--debug', action='store_true', help='trace live K10 communication to stderr; redact tokens')
     control.add_argument("--config", default=default_config, help='vehicle and hardware configuration YAML')
     control.add_argument("--record", metavar="FILE", help='create a new JSONL recording; existing files are not overwritten')
     control.add_argument("--headless", action="store_true", help='offline simulation without a window; requires --seconds')

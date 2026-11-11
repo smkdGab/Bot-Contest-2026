@@ -14,6 +14,7 @@ with termination_cleanup():
 ```
 
 The context registers once and cleans up on exit. See [hardware safety](HARDWARE.md).
+`Robot(..., debug=True)` enables the same communication trace as [CLI `--debug`](CLI.md).
 For continuous servos, use `configure_servo(5, 'continuous')` and
 `servo_speed(5, 20)`; cleanup sends speed zero.
 

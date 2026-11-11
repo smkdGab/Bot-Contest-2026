@@ -91,8 +91,8 @@ def test_leaf_help_lists_connection_options_and_where_to_put_them(capsys):
     assert 'hold speed for SECONDS, then stop' in text
     assert '(default: 1.0)' in text
     assert 'CONNECTION OPTIONS (before the component command)' in text
-    for option in ('--host HOST', '--port PORT', '--http-port HTTP_PORT', '--timeout TIMEOUT',
-                   '--geomag-rate-format GEOMAG_RATE_FORMAT', '--dry-run'):
+    for option in ('--host HOST', '--token TOKEN', '--port PORT', '--http-port HTTP_PORT', '--timeout TIMEOUT',
+                   '--geomag-rate-format GEOMAG_RATE_FORMAT', '--dry-run', '--debug'):
         assert option in text
 
 
@@ -150,6 +150,52 @@ def test_validation_error_names_the_servo_value_and_limits(monkeypatch, capsys):
 
 def test_drive_defaults_to_offline_simulation():
     assert build_parser().parse_args(['drive']).backend == 'sim'
+
+
+def test_help_with_a_supplied_token_never_shows_its_value(capsys):
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(['hardware', '--token', 'Q7z!9', '--help'])
+    text = capsys.readouterr().out
+    assert '--token TOKEN' in text and 'hidden prompt' in text
+    assert 'Q7z!9' not in text
+
+
+@pytest.mark.parametrize('flags', [['--token', 'Q7z!9'], ['--token=Q7z!9']])
+def test_misplaced_token_is_redacted_in_argument_errors(flags, capsys):
+    with pytest.raises(SystemExit) as result:
+        build_parser().parse_args(['hardware', 'ping', *flags])
+    assert result.value.code == 2
+    text = capsys.readouterr().err
+    assert 'Q7z!9' not in text and '<redacted>' in text
+
+
+def test_real_drive_consumes_supplied_token_without_prompting(monkeypatch):
+    from botticelli import control
+    from botticelli import __main__ as cli
+    from botticelli import config
+    monkeypatch.setattr(config, 'load', lambda path:SimpleNamespace(validate=lambda **kwargs:None))
+    monkeypatch.setattr(cli, 'private_token', lambda:pytest.fail('Supplied token prompted'))
+    tokens = []
+    def backend(config, token, *, debug=False):
+        tokens.append((token, debug))
+        raise RuntimeError('backend reached')
+    monkeypatch.setattr(control, 'K10', backend)
+    args = build_parser().parse_args(['drive', '--backend', 'real', '--token', 'Q7z!9', '--debug'])
+    with pytest.raises(RuntimeError, match='backend reached'):
+        drive(args)
+    assert tokens == [('Q7z!9', True)] and args.token is None
+
+
+def test_token_never_reaches_drive_output_or_recording(tmp_path):
+    from pathlib import Path
+    import subprocess
+    import sys
+    path = tmp_path / 'session.jsonl'
+    result = subprocess.run([sys.executable, '-m', 'botticelli', 'drive', '--token', 'Q7z!9',
+        '--headless', '--seconds', '.1', '--record', str(path)],
+        cwd=Path(__file__).resolve().parents[1], capture_output=True, text=True, timeout=15)
+    assert result.returncode == 0, result.stderr
+    assert 'Q7z!9' not in result.stdout + result.stderr + path.read_text()
 
 
 @pytest.mark.parametrize("interrupted", [False, True])

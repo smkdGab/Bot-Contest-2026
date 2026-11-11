@@ -19,12 +19,13 @@ from botticelli.protocol import K10Transport
 from botticelli.primitives import stream_frame
 
 
-def parse(command, server=None, *, dry=False):
+def parse(command, server=None, *, dry=False, token=None):
     parser=hw.Parser()
     commands=parser.add_subparsers(dest='command',required=True)
     hw.add_parser(commands)
     prefix='hardware '+('--dry-run ' if dry else '')
     if server: prefix+=f'--host 127.0.0.1 --port {server.address[1]} '
+    if token is not None: prefix+='--token '+shlex.quote(token)+' '
     return parser.parse_args(shlex.split(prefix+command))
 
 
@@ -426,6 +427,50 @@ def test_dry_run_never_prompts_or_connects(monkeypatch,capsys):
     assert 'DRY RUN: SERVO POSITIONAL ANGLE' in text and 'request.home' in text and '90' in text
 
 
+@pytest.mark.parametrize('failure', [None, 'drop', 'reject'])
+def test_supplied_token_skips_prompt_and_is_never_printed(bot, monkeypatch, capsys, failure):
+    secret = 'Q7z!9'  # synthetic token accepted by the loopback mock
+    monkeypatch.setattr(hw, 'private_token', lambda:pytest.fail('Supplied token prompted'))
+    args = parse('ping', bot, token=secret)
+    args.timeout = .05
+    if failure:
+        getattr(bot, failure).add(0x41)
+        with pytest.raises((TimeoutError, RuntimeError)) as result:
+            hw.run(args)
+        assert secret not in str(result.value)
+    else:
+        hw.run(args)
+    assert args.token is None
+    assert bot.frames()[0] == b'\x41' + secret.encode('ascii')
+    assert bot.frames()[-1] == b'\x42'
+    captured = capsys.readouterr()
+    assert secret not in captured.out + captured.err
+
+
+def test_dry_run_with_token_opens_no_socket_and_redacts_output(monkeypatch, capsys):
+    secret = 'Q7z!9'
+    monkeypatch.setattr(socket, 'socket', lambda *a, **k:pytest.fail('Dry run opened socket'))
+    monkeypatch.setattr(hw, 'private_token', lambda:pytest.fail('Dry run prompted'))
+    args = parse('sensor lidar read', dry=True, token=secret)
+    hw.run(args)
+    assert args.token is None
+    captured = capsys.readouterr()
+    assert secret not in captured.out + captured.err
+    assert 'request.token' not in captured.out
+
+
+@pytest.mark.parametrize('token', ['', '1234', '123456', 'ab cd', 'ab\ncd', 'abcdé'])
+def test_invalid_cli_token_is_rejected_without_echo_or_sockets(monkeypatch, capsys, token):
+    monkeypatch.setattr(socket, 'socket', lambda *a, **k:pytest.fail('Invalid token opened socket'))
+    with pytest.raises(SystemExit) as result:
+        parse('ping', token=token)
+    assert result.value.code == 2
+    text = capsys.readouterr().err
+    assert 'five printable ASCII characters' in text
+    if token:
+        assert token not in text
+
+
 @pytest.mark.parametrize('command,model', [
     ('sensor imu bump watch', 'LIS2DW12'),
     ('sensor lidar intensity read', 'SEN0682'),
@@ -575,6 +620,24 @@ def test_shell_prompts_once_and_recovers_from_invalid_command(bot,monkeypatch,ca
     assert bot.frames()[-4:]==[b'\x23\x01\x00',b'\x28',b'\x24\x02\x00\x5a',b'\x42']
     captured=capsys.readouterr()
     assert 'test!' not in captured.out+captured.err
+
+
+def test_shell_supplied_token_registers_once_before_prompt(bot, monkeypatch, capsys):
+    secret = 'Q7z!9'
+    lines = iter(['ping', 'name', 'exit'])
+    def prompt(text):
+        assert bot.frames()[0] == b'\x41' + secret.encode('ascii')
+        return next(lines)
+    monkeypatch.setattr('builtins.input', prompt)
+    monkeypatch.setattr('sys.stdin.isatty', lambda:True)
+    monkeypatch.setattr(hw, 'private_token', lambda:pytest.fail('Supplied token prompted'))
+    args = parse('shell', bot, token=secret)
+    hw.run(args)
+    assert args.token is None
+    assert sum(p[0] == 0x41 for p in bot.frames()) == 1
+    assert bot.frames()[-2:] == [b'\x28', b'\x42']
+    captured = capsys.readouterr()
+    assert secret not in captured.out + captured.err
 
 
 def test_shell_help_accepts_unix_flags_and_help_command(bot,monkeypatch,capsys):

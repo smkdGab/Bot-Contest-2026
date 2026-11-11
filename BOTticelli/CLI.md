@@ -37,7 +37,8 @@ Use each command's help for complete options.
 python -m botticelli hardware --host HOST shell
 ```
 
-The token is prompted privately before the first shell prompt. Inside the shell:
+The token is prompted privately before the first shell prompt unless supplied
+as `hardware --host HOST --token TOKEN shell`. Inside the shell:
 
 ```text
 help
@@ -60,12 +61,30 @@ python -m botticelli hardware --host HOST sensor imu read
 python -m botticelli hardware --dry-run servo positional angle CHANNEL ANGLE [--seconds SECONDS]
 ```
 
-Connection options: `--host HOST`, `--port PORT` (24642), `--http-port PORT` (80),
-`--timeout SECONDS` (1), `--geomag-rate-format u16be|u8` (u16be).
+Connection options: `--host HOST`, `--token TOKEN` (optional), `--port PORT` (24642), `--http-port PORT` (80),
+`--timeout SECONDS` (1), `--geomag-rate-format u16be|u8` (u16be), `--debug`.
 Live reads and sound register too. `capabilities`, help and dry-run stay offline.
+`--token` skips hidden entry; `drive --backend real` accepts it too. Tokens are
+excluded from program output, but command-line values may appear in shell history
+or process arguments. Omit the option for private entry.
 See [hardware setup and cleanup](HARDWARE.md) before motion.
 Reply timeout, motion duration (`--seconds`) and the 25 ms heartbeat are separate.
 Timeouts include UDP receive/ignored-packet counts; timed-out motion is never retried.
+
+Use `--debug` before the component (or on `drive --backend real`) to trace every
+UDP send/receive, heartbeat gap, ACK/status, decoded reading and cleanup step.
+HTTP operations include request/response bytes. Times are elapsed seconds;
+`rx_seq` and `server_ms` are the bot's packet counter and clock from UDP diagnostics.
+`DROP` explains rejected packets; `WATCHDOG` explains an automatic stop.
+Tokens and Wi-Fi command contents are redacted. Capture stderr to keep the tables readable:
+
+```bash
+python -m botticelli hardware --host HOST --debug servo continuous speed CHANNEL PERCENT --seconds SECONDS 2>TRACE.log
+python -m botticelli hardware --host HOST --debug sensor lidar watch --seconds SECONDS 2>TRACE.log
+```
+
+Debug watches print snapshots. Trace output uses a bounded background queue;
+slow output drops trace lines with a warning and never waits in the heartbeat sender.
 
 ## Hardware commands
 

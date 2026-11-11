@@ -131,6 +131,7 @@ class Parser(argparse.ArgumentParser):
         return super().parse_known_args(args, namespace)
 
     def error(self, message):
+        message = re.sub(r'(--token(?:=|\s+))\S+', r'\1<redacted>', message)
         self.print_usage(sys.stderr)
         help_command = self.prog.removeprefix('k10 ').strip() + ' --help' if self.prog != 'k10' else 'help'
         self.exit(2, f'{self.prog}: {message}\nExample: {self.synopsis()}\nHelp: {help_command}\n')
@@ -151,7 +152,7 @@ def output(value):
 
 def requested(args):
     hidden = {'run', 'upload', 'command', 'component', 'action', 'host', 'port', 'http_port',
-              'timeout', 'geomag_rate_format', 'dry_run', 'full', 'sensor', 'device_name', 'view', 'board', 'family', 'example'}
+              'timeout', 'geomag_rate_format', 'dry_run', 'full', 'sensor', 'device_name', 'view', 'board', 'family', 'example', 'token', 'debug'}
     values = {k:v for k,v in vars(args).items() if k not in hidden and v is not None}
     prefix = {'servo':'S', 'dc-motor':'M', 'led':'L'}.get(args.component)
     if prefix:
@@ -199,6 +200,12 @@ def finite_seconds(text):
     if not math.isfinite(value) or not 0 < value <= 60:
         raise argparse.ArgumentTypeError(f'got {text!r}; duration must be greater than 0 and at most 60 seconds')
     return value
+
+
+def tft_token(text):
+    if len(text) != 5 or any(not 33 <= ord(c) <= 126 for c in text):
+        raise argparse.ArgumentTypeError('expected the five printable ASCII characters from the TFT, without spaces')
+    return text
 
 
 def add_sensor_commands(root, name):
@@ -336,6 +343,8 @@ def add_parser(commands):
     parser = command(commands, 'hardware', 'Test K10 components. Live sessions register once; help and dry-run are offline. Put connection options before the component command.', device='UniHiker K10 / DFRobot DFR1216')
     parser.connection = parser
     parser.add_argument('--host',help='bot IP or hostname (required for live commands)')
+    parser.add_argument('--token', type=tft_token, metavar='TOKEN', help='five-character TFT token; omit for a hidden prompt')
+    parser.add_argument('--debug', action='store_true', help='trace packets, heartbeats, readings and cleanup to stderr; redact tokens')
     parser.add_argument('--port', type=integer_between(1,65535),default=24642, help='K10 UDP port')
     parser.add_argument('--http-port', type=integer_between(1,65535),default=80, help='HTTP port for sound operations')
     parser.add_argument('--timeout', type=float, default=1.0, help='UDP reply timeout seconds (0.05..2); independent of --seconds and heartbeat timing')
@@ -377,22 +386,27 @@ def validate(args):
 class Bench(Robot):
     """CLI formatting and timed tests; hardware operations live in Robot."""
     def __init__(self, args, *, token_provider=None):
-        super().__init__(args.host or 'offline', '', port=args.port, timeout=args.timeout,
-                         http_port=args.http_port, geomag_rate_format=args.geomag_rate_format)
+        token = getattr(args, 'token', None)
+        args.token = None
+        super().__init__(args.host or 'offline', token if token is not None else '', port=args.port, timeout=args.timeout,
+                         http_port=args.http_port, geomag_rate_format=args.geomag_rate_format, debug=getattr(args, 'debug', False))
         self.args = args
         self.token_provider = token_provider or private_token
 
     def connect(self):
-        if not self.attempted:
+        if not self.attempted and not self._token:
             self._token = self.token_provider()
         super().connect()
 
     def wait(self, seconds):
+        started = time.monotonic()
+        self.transport.log('HOLD', f'begin duration={seconds:g}s')
         deadline = time.monotonic() + seconds
         while time.monotonic() < deadline:
             if self.transport.fault.is_set():
                 raise RuntimeError(self.transport.fault_reason or 'Communication failed; session stopped')
             self.transport.done.wait(min(.02, max(0, deadline-time.monotonic())))
+        self.transport.log('HOLD', f'end elapsed={time.monotonic()-started:.3f}s; stop requested')
 
     def execute(self, args):
         validate(args)
@@ -408,6 +422,7 @@ class Bench(Robot):
                 cleanup='stop propulsion; home selected positional servos; disable streams; unregister'))
             return
         self.connect()
+        self.transport.log('COMMAND', label)
         duration = getattr(args, 'seconds', 0) if c in ('servo', 'dc-motor') else 0
         motion_started = None
         held_seconds = None
@@ -490,7 +505,8 @@ class Bench(Robot):
         from .display import Watch
         enabled, seen, received = [], {}, set()
         records = {name:dict(sensor=name, device=SENSOR_NAMES[name], state='WAITING') for name in options['names']}
-        view = Watch(full=options['full'], cell=options.get('cell'))
+        view = Watch(full=options['full'], cell=options.get('cell'), live=not self.debug)
+        self.transport.log('WATCH', f'names={options["names"]} hz={options["hz"]} seconds={options["seconds"]}')
         try:
             started = time.monotonic()
             for name in options['names']:
@@ -506,7 +522,8 @@ class Bench(Robot):
                 else: enabled.append(action)
             deadline, next_draw = time.monotonic()+options['seconds'], 0
             while time.monotonic() < deadline:
-                if self.transport.fault.is_set(): raise RuntimeError('Sensor session or heartbeat failed')
+                if self.transport.fault.is_set():
+                    raise RuntimeError(self.transport.fault_reason or 'Sensor session or heartbeat failed')
                 for name in options['names']:
                     reading = self.latest(name)
                     if reading is None or reading.received_at < started or seen.get(name) == reading.received_at: continue
@@ -533,7 +550,8 @@ class Bench(Robot):
                 view.update(records)
             if not received and options['names'] != ['bump']:
                 self.transport.fault.set()
-                raise TimeoutError('No fresh sensor frames received before the deadline')
+                detail = f'; last rejected event: {self.transport.last_event_error}' if self.transport.last_event_error else ''
+                raise TimeoutError('No fresh sensor frames received before the deadline' + detail)
         finally:
             view.close()
             for action in enabled:

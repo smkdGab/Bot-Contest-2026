@@ -137,6 +137,17 @@ def test_pipes_receive_each_plain_snapshot_without_cursor_controls():
     assert stream.getvalue().count('IMU')==2
 
 
+def test_debug_snapshots_do_not_redraw_over_trace_lines(monkeypatch):
+    monkeypatch.setenv('TERM', 'xterm-256color')
+    stream = TTY()
+    console = Console(file=stream, width=80, height=30, force_terminal=True, color_system=None)
+    with Watch(console=console, live=False) as view:
+        view.update({'imu':dict(sensor='imu', accel_mg=[1, 2, 3])})
+        view.update({'imu':dict(sensor='imu', accel_mg=[4, 5, 6])})
+        assert view.live is None
+    assert '\x1b' not in stream.getvalue() and stream.getvalue().count('IMU') == 2
+
+
 def test_oversized_live_view_falls_back_without_hiding_rows(monkeypatch):
     monkeypatch.setenv('TERM','xterm-256color')
     stream=TTY()

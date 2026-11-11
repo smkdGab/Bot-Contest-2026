@@ -113,10 +113,10 @@ class DrivingRules:
 
 class K10(Robot):
     """Driving adapter: calibration and observations built on Robot primitives."""
-    def __init__(self, config, token):
+    def __init__(self, config, token, *, debug=False):
         config.validate(real=True)
         h = config.hardware
-        super().__init__(h.host, token, port=h.port, timeout=h.timeout)
+        super().__init__(h.host, token, port=h.port, timeout=h.timeout, debug=debug)
         self.config = config
         self.command = DriveCommand()
         self.next_battery = 0

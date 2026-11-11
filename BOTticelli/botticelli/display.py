@@ -242,10 +242,11 @@ def has_color(console):
 
 class Watch:
     """Update this terminal only; append complete snapshots for pipes/overflow."""
-    def __init__(self, *, full=False, console=None, cell=None):
+    def __init__(self, *, full=False, console=None, cell=None, live=True):
         self.console = console or Console(highlight=False, markup=False, emoji=False)
         self.full, self.live = full, None
         self.cell = cell
+        self.live_enabled = live
 
     def __enter__(self):
         return self
@@ -254,7 +255,7 @@ class Watch:
         content = Group(*[render(data, self.console.width, full=self.full, colored=has_color(self.console), cell=self.cell) for data in records.values()])
         fits = len(self.console.render_lines(content, pad=False)) < self.console.height
         tty = getattr(self.console.file, 'isatty', lambda:False)()
-        if tty and self.console.is_terminal and not self.console.is_dumb_terminal and fits:
+        if self.live_enabled and tty and self.console.is_terminal and not self.console.is_dumb_terminal and fits:
             if self.live is None:
                 self.live = Live(content, console=self.console, screen=False, auto_refresh=False,
                                  redirect_stdout=False, redirect_stderr=False)
