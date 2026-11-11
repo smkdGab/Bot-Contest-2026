@@ -127,7 +127,7 @@ def test_recording_and_replay_without_network(tmp_path, monkeypatch, capsys):
         raise AssertionError("Replay tried to open a socket")
     monkeypatch.setattr(socket, "socket", no_network)
     replay(Namespace(path=path, headless=True))
-    assert "offline" in capsys.readouterr().out
+    assert "OFFLINE REPLAY" in capsys.readouterr().out
 
 
 def test_writer_queue_bounded_and_disk_errors_propagated(tmp_path, monkeypatch):

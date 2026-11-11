@@ -3,3 +3,4 @@
 pygame-ce==2.5.8
 PyYAML==6.0.3
 pytest==9.2.0
+rich==14.3.4

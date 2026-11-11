@@ -144,7 +144,8 @@ def run_battle(args):
     if args.screenshot and args.headless:
         raise ValueError('--screenshot needs a windowed battle')
     setup = load_battle(args.config, seed=args.seed, opponents=args.opponents)
-    print(f'Battle seed: {setup["seed"]}; opponents: {len(setup["cars"])-1}', flush=True)
+    from .display import output
+    output(dict(test='battle', seed=setup['seed'], opponents=len(setup['cars'])-1))
     session = BattleSession(setup)
     recorder = Recorder(args.record, Config(), 'battle', setup=setup) if args.record else None
     window = None
@@ -166,7 +167,9 @@ def run_battle(args):
                     break
             if recorder and not world.finished:
                 recorder.emit('result', {'time': world.time, 'complete': False, 'reason': 'duration limit', 'winner': None, 'draw': False}, recorder.origin+world.time)
-            print(f'Battle at {world.time:.2f}s: '+('draw' if world.finished and world.winner is None else f'winner {world.winner}' if world.finished else f'{sum(not c.eliminated for c in world.cars)} surviving (duration limit)'))
+            output(dict(test='battle result', time_s=world.time,
+                result='draw' if world.finished and world.winner is None else f'winner {world.winner}' if world.finished else 'duration limit',
+                surviving=sum(not c.eliminated for c in world.cars)))
             return
         import pygame
         from .dashboard import GamepadReader
@@ -185,7 +188,7 @@ def run_battle(args):
             if restart:
                 setup = setup if restart.mod & pygame.KMOD_SHIFT else load_battle(args.config, opponents=args.opponents)
                 session = BattleSession(setup)
-                print(f'Battle seed: {setup["seed"]}', flush=True)
+                output(dict(test='new battle', seed=setup['seed']))
                 if recorder:
                     recorder.emit('setup', setup)
                 previous_pause = None
@@ -247,7 +250,8 @@ def replay_battle(args, metadata, records):
                         return
                     window.draw(setup, snapshot, state)
         if args.headless:
-            print(f'Read {count} battle records offline (schema 2)')
+            from .display import output
+            output(dict(test='offline battle replay', records=count, schema=2))
     finally:
         if window:
             window.close()

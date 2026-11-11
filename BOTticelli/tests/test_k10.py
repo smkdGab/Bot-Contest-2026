@@ -109,7 +109,7 @@ def test_register_configure_diagnostics_lidar_motion_and_cleanup(bot):
         client.close()
     frames = bot.frames()
     assert [p[0] for p in frames[:3]] == [0x41, 0x22, 0x22]
-    assert frames[-4:] == [b"\x23\x01\x00", b"\x28", b"\x83\x00\x08\x00", b"\x42"]
+    assert frames[-5:] == [b"\x23\x01\x00", b"\x28", b"\x24\x02\x00\x5a", b"\x83\x00\x08\x00", b"\x42"]
     assert not client.cleanup_errors
 
 
@@ -170,7 +170,7 @@ def test_cleanup_attempts_all_stops_and_unregister_even_if_zero_fails(bot):
     bot.drop.add(0x23)
     client.close()
     frames = bot.frames()
-    assert frames[-5:] == [b"\x23\x01\x00", b"\x23\x10\x00", b"\x28", b"\x83\x00\x08\x00", b"\x42"]
+    assert frames[-6:] == [b"\x23\x01\x00", b"\x23\x10\x00", b"\x28", b"\x24\x02\x00\x5a", b"\x83\x00\x08\x00", b"\x42"]
     assert client.cleanup_errors
 
 

@@ -16,6 +16,7 @@ import pytest
 
 from botticelli import hardware as hw
 from botticelli.k10 import K10Transport
+from botticelli.primitives import stream_frame
 
 
 def parse(command, server=None, *, dry=False):
@@ -87,6 +88,8 @@ class Bot:
             elif a==0xA1: reply+=struct.pack('<hhh',1,-2,1000)
             elif a==0xA5: reply+=struct.pack('<BHBB',1,100,0,1)
             elif a==0xA8: reply+=struct.pack('<HH',500,100)
+            elif a==0xA3: reply+=bytes([1])+struct.pack('<H',100)
+            elif a==0x73: reply+=bytes([1,8])
             elif a==0x75: reply+=bytes([4])+struct.pack('<H',3)
             elif a==0x78: reply+=bytes([1,1,0,0,1,0,0x31])
             elif a==0x81: reply+=struct.pack('<HIH',4,1234,512)+struct.pack('<512H',*([123]*512))
@@ -118,50 +121,50 @@ def bench(args):
 
 @pytest.mark.parametrize('channel',range(6))
 def test_every_servo_channel_configures_before_absolute_angle_and_cleans_up(bot,channel):
-    args=parse(f'servo angle S{channel} 120 --type 180 --seconds .001',bot)
-    with bench(args) as b: b.execute(hw.build_plan(args))
+    args=parse(f'servo angle S{channel} 120 --type 180 --home 90 --seconds .001',bot)
+    with bench(args) as b: b.execute(hw.validate(args))
     assert bot.frames()[:3]==[b'\x41test!',bytes([0x22,1<<channel,0]),bytes([0x24,1<<channel,0,120])]
-    assert bot.frames()[-2:]==[b'\x28',b'\x42']
+    assert bot.frames()[-3:]==[b'\x28',bytes([0x24,1<<channel,0,90]),b'\x42']
     assert not b.cleanup_errors
 
 
 def test_increment_reads_then_validates_and_uses_configured_angle_command(bot):
-    args=parse('servo increment S4 15 --type 270 --min-angle 30 --max-angle 150 --seconds .001',bot)
-    with bench(args) as b: b.execute(hw.build_plan(args))
+    args=parse('servo increment S4 15 --type 270 --home 90 --min-angle 30 --max-angle 150 --seconds .001',bot)
+    with bench(args) as b: b.execute(hw.validate(args))
     assert bot.frames()[1:4]==[b'\x22\x10\x01',b'\x27\x10',b'\x24\x10\x00\x69']
-    args=parse('servo increment S4 100 --type 270 --max-angle 150 --seconds .001',bot)
-    before=sum(p[0]==0x24 for p in bot.frames())
+    args=parse('servo increment S4 100 --type 270 --home 90 --max-angle 150 --seconds .001',bot)
+    before=len(bot.frames())
     with bench(args) as b:
-        with pytest.raises(ValueError,match='safe limits'): b.execute(hw.build_plan(args))
-    assert sum(p[0]==0x24 for p in bot.frames())==before
+        with pytest.raises(ValueError,match='safe limits'): b.execute(hw.validate(args))
+    assert [p for p in bot.frames()[before:] if p[0]==0x24]==[b'\x24\x10\x00\x5a']
 
 
 @pytest.mark.parametrize('failure',['reject','drop'])
 def test_failed_registration_never_configures_or_moves(bot,failure):
     getattr(bot,failure).add(0x41)
-    args=parse('servo angle S0 90 --type 180',bot)
+    args=parse('servo angle S0 90 --type 180 --home 90',bot)
     with bench(args) as b:
-        with pytest.raises((RuntimeError,TimeoutError)): b.execute(hw.build_plan(args))
+        with pytest.raises((RuntimeError,TimeoutError)): b.execute(hw.validate(args))
     assert bot.frames()==[b'\x41test!',b'\x42']
 
 
 @pytest.mark.parametrize('failure',['drop','wrong','malformed','reject'])
 def test_bad_reply_stops_session_without_motion_retry(bot,failure):
     getattr(bot,failure).add(0x24)
-    args=parse('servo angle S2 90 --type 180 --seconds .001',bot)
+    args=parse('servo angle S2 120 --type 180 --home 90 --seconds .001',bot)
     with bench(args) as b:
-        with pytest.raises((RuntimeError,TimeoutError)): b.execute(hw.build_plan(args))
-        with pytest.raises(RuntimeError): b.execute(hw.build_plan(parse('servo speed S0 10 --seconds .001',bot)))
-    assert sum(p[0]==0x24 for p in bot.frames())==1
+        with pytest.raises((RuntimeError,TimeoutError)): b.execute(hw.validate(args))
+        with pytest.raises(RuntimeError): b.execute(hw.validate(parse('servo speed S0 10 --seconds .001',bot)))
+    assert sum(p==b'\x24\x04\x00\x78' for p in bot.frames())==1
     assert not any(p[0]==0x23 and p[2] for p in bot.frames())
-    assert bot.frames()[-2:]==[b'\x28',b'\x42']
+    assert bot.frames()[-3:]==[b'\x28',b'\x24\x04\x00\x5a',b'\x42']
 
 
 def test_uncertain_continuous_type_is_individually_zeroed_before_dc_stop_and_unregister(bot):
     bot.drop.add(0x22)
     args=parse('servo speed S5 -25 --seconds .001',bot)
     with bench(args) as b:
-        with pytest.raises(TimeoutError): b.execute(hw.build_plan(args))
+        with pytest.raises(TimeoutError): b.execute(hw.validate(args))
     assert bot.frames()[-3:]==[b'\x23\x20\x00',b'\x28',b'\x42']
     assert not any(p[0]==0x23 and p[2]!=0 for p in bot.frames())
 
@@ -169,14 +172,14 @@ def test_uncertain_continuous_type_is_individually_zeroed_before_dc_stop_and_unr
 def test_continuous_speed_is_timed_heartbeat_independent_and_interruption_stops(bot,monkeypatch):
     args=parse('servo speed S5 -25 --seconds .09',bot)
     with bench(args) as b:
-        b.execute(hw.build_plan(args))
+        b.execute(hw.validate(args))
         assert bot.frames()[-2:]==[b'\x23\x20\x00',b'\x28']
         times=[t for t,p in bot.packets if p[0]==0x43]
         assert len(times)>=3 and max(y-x for x,y in zip(times,times[1:]))<.05
         assert b'\x23\x20\xe7' in bot.frames()
         def interrupted(seconds): raise KeyboardInterrupt
         monkeypatch.setattr(b,'wait',interrupted)
-        with pytest.raises(KeyboardInterrupt): b.execute(hw.build_plan(args))
+        with pytest.raises(KeyboardInterrupt): b.execute(hw.validate(args))
         assert bot.frames()[-2:]==[b'\x23\x20\x00',b'\x28']
     assert bot.frames()[-3:]==[b'\x23\x20\x00',b'\x28',b'\x42']
 
@@ -184,12 +187,12 @@ def test_continuous_speed_is_timed_heartbeat_independent_and_interruption_stops(
 def test_multiple_continuous_cleanup_and_retyping_positionals(bot):
     args=parse('servo type S0 continuous',bot)
     with bench(args) as b:
-        b.execute(hw.build_plan(args))
-        b.execute(hw.build_plan(parse('servo type S4 continuous',bot)))
-        b.execute(hw.build_plan(parse('servo type S0 180',bot)))
+        b.execute(hw.validate(args))
+        b.execute(hw.validate(parse('servo type S4 continuous',bot)))
+        b.execute(hw.validate(parse('servo type S0 180 --home 90',bot)))
         assert b.continuous=={4}
         bot.drop.add(0x23)
-    assert bot.frames()[-3:]==[b'\x23\x10\x00',b'\x28',b'\x42']
+    assert bot.frames()[-4:]==[b'\x23\x10\x00',b'\x28',b'\x24\x01\x00\x5a',b'\x42']
     assert b.cleanup_errors
 
 
@@ -204,33 +207,38 @@ def test_multiple_continuous_cleanup_and_retyping_positionals(bot):
 ])
 def test_output_and_configuration_frames(bot,command,frame):
     args=parse(command,bot)
-    with bench(args) as b: b.execute(hw.build_plan(args))
+    with bench(args) as b: b.execute(hw.validate(args))
     assert bot.frames()[0]==b'\x41test!' and frame in bot.frames()
 
 
 @pytest.mark.parametrize('command,key',[
-    ('ping','pong'),('name','name'),('battery','battery_percent'),('servo read S0 S5','commanded_degrees'),
-    ('motor read M1 M4','commanded_percent'),('led read L0 L4','leds'),('board-led read','board_leds'),
-    ('sensor imu read','accel_mg'),('sensor imu config','rate_hz'),('sensor bump config','threshold_mg'),
-    ('sensor camera algorithm','learned_id_count'),('sensor camera controls','illumination_supported'),
-    ('sensor lidar read','distance_mm'),
+    ('ping','pong'),('name','loopback'),('battery','battery percent'),('servo read S0 S5','DEG (commanded)'),
+    ('motor read M1 M4','% (commanded)'),('led read L0 L4','BRIGHTNESS'),('board-led read','no board LED readings'),
+    ('sensor imu read','X mg'),('sensor imu config','rate hz'),('sensor bump config','threshold mg'),
+    ('sensor camera algorithm','learned id count'),('sensor camera controls','illumination supported'),
+    ('sensor lidar read','8x64 mm'),
 ])
-def test_read_only_queries_exact_layouts_and_no_registration(bot,command,key,capsys):
+def test_read_only_queries_register_first_without_configuring_servos(bot,command,key,capsys):
     args=parse(command,bot)
-    with bench(args) as b: b.execute(hw.build_plan(args))
-    data=json.loads(capsys.readouterr().out)
-    assert key in data
-    assert not any(p[0] in (0x41,0x22,0x23,0x24,0x28,0x42) for p in bot.frames())
+    with bench(args) as b: b.execute(hw.validate(args))
+    text=capsys.readouterr().out
+    assert key in text and not text.lstrip().startswith('{')
+    assert bot.frames()[0]==b'\x41test!'
+    assert bot.frames()[-2:]==[b'\x28',b'\x42']
+    assert not any(p[0] in (0x22,0x23,0x24) for p in bot.frames())
 
 
 @pytest.mark.parametrize('name',['lidar','intensity','imu','compass','camera','bump','all'])
 def test_streams_separate_events_from_ack_and_disable_on_exit(bot,name,capsys):
     bot.bump=True
     args=parse(f'sensor {name} watch --hz 8 --seconds .06',bot)
-    with bench(args) as b: b.execute(hw.build_plan(args))
-    records=[json.loads(line) for line in capsys.readouterr().out.splitlines()]
-    names={r['sensor'] for r in records}
-    assert name in names if name!='all' else {'lidar','intensity','imu','compass','camera','bump'}<=names
+    with bench(args) as b: b.execute(hw.validate(args))
+    text=capsys.readouterr().out
+    expected={'lidar':'8x64 mm','intensity':'8x64 raw','imu':'X mg','compass':'HEADING deg',
+              'camera':'320x240 px','bump':'impact 1 X+'}
+    for key in expected if name=='all' else [name]:
+        assert expected[key] in text
+    assert '\x1b' not in text
     enables=[p for p in bot.frames() if p[0] in (0x83,0x89,0xA2,0x93,0x72) and p[1]]
     assert len(enables)==5 if name=='all' else len(enables)==1
     for enable in enables: assert enable[:1]+b'\x00'+enable[2:] in bot.frames()
@@ -239,11 +247,11 @@ def test_streams_separate_events_from_ack_and_disable_on_exit(bot,name,capsys):
 
 def test_compass_rate_format_explicit_and_no_automatic_fallback(bot,capsys):
     args=parse('sensor compass read --hz 10',bot)
-    assert hw.stream_frame('compass',10,'u16be')==b'\x93\x01\x00\x0a'
-    assert hw.stream_frame('compass',10,'u8')==b'\x93\x01\x0a'
+    assert stream_frame('compass',10,'u16be')==b'\x93\x01\x00\x0a'
+    assert stream_frame('compass',10,'u8')==b'\x93\x01\x0a'
     bot.reject.add(0x93)
     with bench(args) as b:
-        with pytest.raises(RuntimeError,match='rejected'): b.execute(hw.build_plan(args))
+        with pytest.raises(RuntimeError,match='rejected'): b.execute(hw.validate(args))
     assert [p for p in bot.frames() if p[0]==0x93]==[b'\x93\x01\x00\x0a']
     assert 'unsupported' in capsys.readouterr().out
 
@@ -251,14 +259,15 @@ def test_compass_rate_format_explicit_and_no_automatic_fallback(bot,capsys):
 def test_bump_without_impact_is_not_transport_failure(bot,capsys):
     args=parse('sensor bump watch --seconds .04',bot)
     with bench(args) as b:
-        b.execute(hw.build_plan(args))
+        b.execute(hw.validate(args))
         assert not b.transport.fault.is_set()
-    assert json.loads(capsys.readouterr().out)['events_received']==0
+    text=capsys.readouterr().out
+    assert 'NO EVENTS' in text and 'events received' in text
 
 
 @pytest.mark.parametrize('command',[
-    'servo angle S6 90 --type 180','servo angle S0 181 --type 180','servo angle S0 20',
-    'servo angle S0 20 --type 180 --min-angle 30','servo speed S0 101',
+    'servo angle S6 90 --type 180 --home 90','servo angle S0 181 --type 180 --home 90','servo angle S0 20',
+    'servo angle S0 20 --type 180 --home 90 --min-angle 30','servo speed S0 101',
     'motor speed M0 10','motor speed M5 10','motor speed M1 1 --seconds nan',
     'motor speed M1 1 --seconds 0','led set L5 --rgb 0 0 0',
     'sensor lidar watch --hz 9','sound play ../bad.wav',
@@ -272,10 +281,22 @@ def test_invalid_values_fail_before_sockets(command,monkeypatch):
 def test_dry_run_never_prompts_or_connects(monkeypatch,capsys):
     monkeypatch.setattr(socket,'socket',lambda *a,**k:pytest.fail('Dry run opened socket'))
     monkeypatch.setattr(hw,'private_token',lambda:pytest.fail('Dry run prompted for token'))
-    args=parse('servo angle S3 90 --type 270',dry=True)
+    args=parse('servo angle S3 90 --type 270 --home 90',dry=True)
     hw.run(args)
-    data=json.loads(capsys.readouterr().out)
-    assert data['requests'][0]['hex']=='22 08 01' and data['requests'][1]['hex']=='24 08 00 5a'
+    text=capsys.readouterr().out
+    assert 'DRY RUN: SERVO ANGLE' in text and 'request.home' in text and '90' in text
+
+
+def test_capabilities_is_offline_and_omits_unavailable_inventory(monkeypatch,capsys):
+    monkeypatch.setattr(socket,'socket',lambda *a,**k:pytest.fail('Capabilities opened a socket'))
+    monkeypatch.setattr(hw,'private_token',lambda:pytest.fail('Capabilities prompted for token'))
+    hw.run(parse('capabilities'))
+    text=capsys.readouterr().out.lower()
+    for feature in ('servo','motor','battery','lidar','compass','imu','huskylens','leds','display','sound'):
+        assert feature in text
+    for item in ('unavailable','unsupported','temperature','humidity','microphone','ultrasonic',
+                 'geomag discrepancy','protocol gaps','dry-run','shell'):
+        assert item not in text
 
 
 def test_private_token_nonterminal_rejected_without_exposure(monkeypatch):
@@ -288,7 +309,7 @@ def test_readback_wrong_echoed_mask_poisons_session(bot,monkeypatch):
     with bench(args) as b:
         b.connect()
         monkeypatch.setattr(b.transport,'request',lambda *a,**k:b'\x27\x00\x02\x00\x5a')
-        with pytest.raises(ValueError,match='mask'): b.execute(hw.build_plan(args))
+        with pytest.raises(ValueError,match='mask'): b.execute(hw.validate(args))
         assert b.transport.fault.is_set()
 
 
@@ -314,15 +335,15 @@ def http_bot():
     finally: server.shutdown(); server.server_close(); thread.join(timeout=1)
 
 
-def test_sound_http_operations_never_register_or_create_udp(http_bot,monkeypatch,tmp_path):
+def test_sound_http_operations_register_first(http_bot,bot,monkeypatch,tmp_path):
     port,state,calls=http_bot
-    monkeypatch.setattr('botticelli.k10.K10Transport',lambda *a,**k:pytest.fail('Sound created UDP transport'))
+    monkeypatch.setattr(hw,'private_token',lambda:'test!')
     path=tmp_path/'beep.wav'
     with wave.open(str(path),'wb') as wav:
         wav.setparams((1,1,11025,0,'NONE','not compressed')); wav.writeframes(bytes([128])*100)
     for command in ('sound list','sound status','sound play beep.wav','sound volume 25','sound stop',
                     f'sound upload new.wav {path}','sound delete beep.wav'):
-        args=parse(command); args.host='127.0.0.1'; args.http_port=port
+        args=parse(command,bot); args.http_port=port
         hw.run(args)
     assert ('POST','/sounds/beep.wav/play',b'') in calls
     assert ('POST','/sounds/volume?value=25',b'') in calls
@@ -330,8 +351,10 @@ def test_sound_http_operations_never_register_or_create_udp(http_bot,monkeypatch
     uploaded=[data for method,path,data in calls if path=='/sounds/new.wav']
     assert uploaded==[path.read_bytes()]
     state.update(playback_state='playing',playing=True)
-    args=parse(f'sound upload new.wav {path}'); args.host='127.0.0.1'; args.http_port=port
+    args=parse(f'sound upload new.wav {path}',bot); args.http_port=port
     with pytest.raises(ValueError,match='inactive'): hw.run(args)
+    assert sum(p[0]==0x41 for p in bot.frames())==8
+    assert bot.frames()[-1]==b'\x42'
 
 
 def test_timed_motion_stops_before_output_can_block(bot,monkeypatch):
@@ -341,7 +364,7 @@ def test_timed_motion_stops_before_output_can_block(bot,monkeypatch):
         raise BrokenPipeError('closed output')
     monkeypatch.setattr(hw,'output',blocked_output)
     with bench(args) as b:
-        with pytest.raises(BrokenPipeError): b.execute(hw.build_plan(args))
+        with pytest.raises(BrokenPipeError): b.execute(hw.validate(args))
     assert bot.frames()[-3:]==[b'\x23\x04\x00',b'\x28',b'\x42']
 
 
@@ -349,15 +372,30 @@ def test_no_sensor_frames_times_out_and_disables_stream(bot,monkeypatch):
     monkeypatch.setattr(bot,'emit',lambda:None)
     args=parse('sensor camera read --seconds .04',bot)
     with bench(args) as b:
-        with pytest.raises(TimeoutError,match='fresh'): b.execute(hw.build_plan(args))
+        with pytest.raises(TimeoutError,match='fresh'): b.execute(hw.validate(args))
         assert b.transport.fault.is_set()
     assert b'\x72\x00\x08' in bot.frames() and bot.frames()[-1]==b'\x42'
 
 
+def test_watch_output_failure_still_disables_streams_and_unregisters(bot,monkeypatch):
+    from botticelli.display import Watch
+    def broken_output(*args):
+        raise BrokenPipeError('closed output')
+    monkeypatch.setattr(Watch,'update',broken_output)
+    args=parse('sensor all watch --seconds .05',bot)
+    with bench(args) as b:
+        with pytest.raises(BrokenPipeError): b.execute(hw.validate(args))
+    assert not bot.active
+    assert bot.frames()[-2:]==[b'\x28',b'\x42']
+
+
 def test_shell_prompts_once_and_recovers_from_invalid_command(bot,monkeypatch,capsys):
-    lines=iter(['servo angle S0 999 --type 180','servo type S0 continuous',
-                'servo angle S1 90 --type 180 --seconds .001','exit'])
-    monkeypatch.setattr('builtins.input',lambda prompt:next(lines))
+    lines=iter(['servo angle S0 999 --type 180 --home 90','servo type S0 continuous',
+                'servo angle S1 90 --type 180 --home 90 --seconds .001','exit'])
+    def prompt(text):
+        assert bot.frames()[0]==b'\x41test!'
+        return next(lines)
+    monkeypatch.setattr('builtins.input',prompt)
     monkeypatch.setattr('sys.stdin.isatty',lambda:True)
     prompts=[]
     monkeypatch.setattr(hw,'private_token',lambda:prompts.append(True) or 'test!')
@@ -365,6 +403,19 @@ def test_shell_prompts_once_and_recovers_from_invalid_command(bot,monkeypatch,ca
     assert len(prompts)==1
     assert sum(p[0]==0x41 for p in bot.frames())==1
     assert b'\x24\x02\x00\x5a' in bot.frames()
-    assert bot.frames()[-3:]==[b'\x23\x01\x00',b'\x28',b'\x42']
+    assert bot.frames()[-4:]==[b'\x23\x01\x00',b'\x28',b'\x24\x02\x00\x5a',b'\x42']
     captured=capsys.readouterr()
     assert 'test!' not in captured.out+captured.err
+
+
+def test_shell_help_accepts_unix_flags_and_help_command(bot,monkeypatch,capsys):
+    lines=iter(['help servo angle', 'sensor imu configure -h', 'servo speed --help', 'exit'])
+    monkeypatch.setattr('builtins.input',lambda prompt:next(lines))
+    monkeypatch.setattr('sys.stdin.isatty',lambda:True)
+    monkeypatch.setattr(hw,'private_token',lambda:'test!')
+    hw.run(parse('shell',bot))
+    captured=capsys.readouterr()
+    assert captured.out.count('usage:')==3
+    assert captured.out.count('Example:')==3
+    assert not captured.err
+    assert bot.frames()==[b'\x41test!',b'\x28',b'\x42']

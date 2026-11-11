@@ -8,6 +8,27 @@ import struct
 
 
 @dataclass(frozen=True)
+class LidarFrame:
+    frame_id: int
+    timestamp_ms: int
+    received_at: float  # local monotonic seconds, never the bot's clock
+    values_mm: tuple[int, ...]
+
+    def fresh(self, now: float, threshold: float) -> bool:
+        return 0 <= now - self.received_at <= threshold
+
+
+def decode_frame(body: bytes, received_at: float) -> LidarFrame:
+    """Decode after diagnostics removal, with exact full-matrix length validation."""
+    if len(body) != 1034 or body[0] != 0x8F or body[1] != 0:
+        raise ValueError('Invalid LiDAR action, status, or length')
+    frame_id, timestamp, count = struct.unpack_from('<HIH', body, 2)
+    if count != 512:
+        raise ValueError('Expected full 64 x 8 LiDAR frame')
+    return LidarFrame(frame_id, timestamp, received_at, struct.unpack_from('<512H', body, 10))
+
+
+@dataclass(frozen=True)
 class SensorReading:
     name: str
     received_at: float
